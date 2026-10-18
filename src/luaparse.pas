@@ -25,7 +25,7 @@ uses
 function LuaCompile(L: TLua; const source: RawByteString; const name: string): TFunction;
 var
   decl: TFuncDecl;
-  owner: TObjectList;
+  owner: TAstOwner;
   p: TProto;
 begin
   decl := ParseChunk(L, source, name, owner);

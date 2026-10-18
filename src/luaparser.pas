@@ -14,7 +14,7 @@ uses
 // Parses a chunk. 'owner' receives every node created (the caller frees it
 // after code generation).
 function ParseChunk(L: TLua; const source: RawByteString; const chunkName: string;
-                    out owner: TObjectList): TFuncDecl;
+                    out owner: TAstOwner): TFuncDecl;
 
 implementation
 
@@ -87,12 +87,13 @@ type
   public
     L: TLua;
     Lex: TLexer;
+    ForStateName: TStringObj;   // '(for state)'
     FS: TFuncScope;
-    Owner: TObjectList;
+    Owner: TAstOwner;
     EnvName: TStringObj;
     Level: Integer;
     constructor Create(AL: TLua; const source: RawByteString; const chunkName: string;
-                       AOwner: TObjectList);
+                       AOwner: TAstOwner);
     destructor Destroy; override;
     function Parse: TFuncDecl;
   private
@@ -106,6 +107,15 @@ type
     procedure CheckNext(t: TTokenKind);
     procedure CheckMatch(what, who: TTokenKind; line: Integer);
     function CheckName: TStringObj;
+    // error reporting lives in separate routines: a routine that builds strings gets an
+    // exception frame, and the callers below are hot
+    procedure ErrExpected(t: TTokenKind);
+    procedure ErrMatch(what, who: TTokenKind; line: Integer);
+    procedure ErrLimit(limit: Integer; const what: string);
+    procedure ErrNoLabel(name: TStringObj; line: Integer);
+    procedure ErrName(const fmt: string; name: TStringObj);
+    procedure ErrLabelDup(name: TStringObj; line: Integer);
+    procedure ErrAttr(const attr: string);
     procedure SemError(const msg: string);
     procedure SyntaxError(const msg: string);
     procedure EnterLevel;
@@ -120,7 +130,7 @@ type
     procedure Activate(scope: TFuncScope; const e: TActEntry);
     procedure ActivateLocal(v: TVarInfo);
     function NewLocal(name: TStringObj; kind: TVarKind): TVarInfo;
-    function ActiveRegVars(scope: TFuncScope): TVarInfoArray;
+    procedure ActiveRegVarsInto(scope: TFuncScope; var res: TVarInfoArray);
     function CurBlock: PBlockScope;
     // variable resolution
     function SearchVar(scope: TFuncScope; name: TStringObj; var res: TVarRes): Boolean;
@@ -143,7 +153,7 @@ type
     function PrimaryExp: TExpr;
     function Constructor_: TExpr;
     function FuncArgs(fn: TExpr; const method: TStringObj; isMethod: Boolean): TExpr;
-    function ExprList: TExprArray;
+    procedure ExprListInto(var res: TExprArray);
     function Body(isMethod: Boolean; line: Integer): TFuncDecl;
     procedure ParList(decl: TFuncDecl);
     function MakeUnary(op: TOp; e: TExpr; line: Integer): TExpr;
@@ -162,7 +172,7 @@ type
     procedure ForStat(blk: TBlock; line: Integer);
     procedure ForNum(s: TStmt; varname: TStringObj; line: Integer);
     procedure ForList(s: TStmt; indexname: TStringObj; line: Integer);
-    procedure ForBody(s: TStmt; var vars: TVarInfoArray; line: Integer);
+    procedure ForBody(s: TStmt; line: Integer);
     procedure FuncStat(blk: TBlock; line: Integer);
     procedure LocalFunc(blk: TBlock; line: Integer);
     procedure LocalStat(blk: TBlock; line: Integer);
@@ -179,10 +189,11 @@ type
 { ===================================================================== }
 
 constructor TParser.Create(AL: TLua; const source: RawByteString; const chunkName: string;
-  AOwner: TObjectList);
+  AOwner: TAstOwner);
 begin
   L := AL;
   Owner := AOwner;
+  ForStateName := AL.NewString('(for state)');
   Lex := TLexer.Create(AL, source, ChunkIdStr(chunkName));
   EnvName := AL.NewString('_ENV');
 end;
@@ -201,7 +212,7 @@ end;
 
 function TParser.NewExpr(k: TExprKind; line: Integer): TExpr;
 begin
-  Result := TExpr.Create;
+  Result := TExpr(TExpr.NewInstance);
   Owner.Add(Result);
   Result.Kind := k;
   Result.Line := line;
@@ -209,7 +220,7 @@ end;
 
 function TParser.NewStmt(k: TStmtKind; line: Integer): TStmt;
 begin
-  Result := TStmt.Create;
+  Result := TStmt(TStmt.NewInstance);
   Owner.Add(Result);
   Result.Kind := k;
   Result.Line := line;
@@ -228,8 +239,7 @@ end;
 
 procedure TParser.Check(t: TTokenKind);
 begin
-  if Lex.Tok <> t then
-    SyntaxError(Lex.TokenStr(t) + ' expected');
+  if Lex.Tok <> t then ErrExpected(t);
 end;
 
 procedure TParser.CheckNext(t: TTokenKind);
@@ -240,21 +250,59 @@ end;
 
 procedure TParser.CheckMatch(what, who: TTokenKind; line: Integer);
 begin
-  if not TestNext(what) then
-  begin
-    if line = Lex.Line then
-      SyntaxError(Lex.TokenStr(what) + ' expected')
-    else
-      SyntaxError(Format('%s expected (to close %s at line %d)',
-                         [Lex.TokenStr(what), Lex.TokenStr(who), line]));
-  end;
+  if not TestNext(what) then ErrMatch(what, who, line);
 end;
 
 function TParser.CheckName: TStringObj;
 begin
   Check(tkName);
-  Result := Lex.NewStr(RawByteString(Lex.NameVal));
+  Result := Lex.NameStr;
   Lex.Next;
+end;
+
+procedure TParser.ErrExpected(t: TTokenKind);
+begin
+  SyntaxError(Lex.TokenStr(t) + ' expected');
+end;
+
+procedure TParser.ErrMatch(what, who: TTokenKind; line: Integer);
+begin
+  if line = Lex.Line then
+    SyntaxError(Lex.TokenStr(what) + ' expected')
+  else
+    SyntaxError(Format('%s expected (to close %s at line %d)',
+                       [Lex.TokenStr(what), Lex.TokenStr(who), line]));
+end;
+
+procedure TParser.ErrLimit(limit: Integer; const what: string);
+var
+  line: Integer;
+  where: string;
+begin
+  line := FS.Decl.LineDefined;
+  if line = 0 then where := 'main function'
+  else where := Format('function at line %d', [line]);
+  SyntaxError(Format('too many %s (limit is %d) in %s', [what, limit, where]));
+end;
+
+procedure TParser.ErrNoLabel(name: TStringObj; line: Integer);
+begin
+  SemError(Format('no visible label ''%s'' for <goto> at line %d', [name.ToStr, line]));
+end;
+
+procedure TParser.ErrName(const fmt: string; name: TStringObj);
+begin
+  SemError(Format(fmt, [name.ToStr]));
+end;
+
+procedure TParser.ErrLabelDup(name: TStringObj; line: Integer);
+begin
+  SemError(Format('label ''%s'' already defined on line %d', [name.ToStr, line]));
+end;
+
+procedure TParser.ErrAttr(const attr: string);
+begin
+  SemError(Format('unknown attribute ''%s''', [attr]));
 end;
 
 procedure TParser.SemError(const msg: string);
@@ -281,17 +329,8 @@ begin
 end;
 
 procedure TParser.CheckLimit(v, limit: Integer; const what: string);
-var
-  line: Integer;
-  where: string;
 begin
-  if v > limit then
-  begin
-    line := FS.Decl.LineDefined;
-    if line = 0 then where := 'main function'
-    else where := Format('function at line %d', [line]);
-    SyntaxError(Format('too many %s (limit is %d) in %s', [what, limit, where]));
-  end;
+  if v > limit then ErrLimit(limit, what);
 end;
 
 { ===================================================================== }
@@ -309,19 +348,19 @@ begin
       Inc(Result);
 end;
 
-function TParser.ActiveRegVars(scope: TFuncScope): TVarInfoArray;
+procedure TParser.ActiveRegVarsInto(scope: TFuncScope; var res: TVarInfoArray);
 var
   i, n: Integer;
 begin
-  SetLength(Result, scope.NAct);
+  SetLength(res, scope.NAct);
   n := 0;
   for i := 0 to scope.NAct - 1 do
     if (scope.Act[i].Kind = akLocal) and (scope.Act[i].Info.Kind <> vkCtc) then
     begin
-      Result[n] := scope.Act[i].Info;
+      res[n] := scope.Act[i].Info;
       Inc(n);
     end;
-  SetLength(Result, n);
+  SetLength(res, n);
 end;
 
 function TParser.CurBlock: PBlockScope;
@@ -376,8 +415,7 @@ begin
   begin
     // outermost block of the function: pending gotos have no label
     if bl.FirstGoto < FS.NGotos then
-      SemError(Format('no visible label ''%s'' for <goto> at line %d',
-                      [FS.Gotos[bl.FirstGoto].Name.ToStr, FS.Gotos[bl.FirstGoto].Line]));
+      ErrNoLabel(FS.Gotos[bl.FirstGoto].Name, FS.Gotos[bl.FirstGoto].Line);
   end;
 end;
 
@@ -391,7 +429,7 @@ end;
 
 function TParser.NewLocal(name: TStringObj; kind: TVarKind): TVarInfo;
 begin
-  Result := TVarInfo.Create;
+  Result := TVarInfo(TVarInfo.NewInstance);
   Owner.Add(Result);
   Result.Name := name;
   Result.Kind := kind;
@@ -483,7 +521,7 @@ begin
   FS := scope;
   CheckLimit(n + 1, MAXUPVAL, 'upvalues');
   FS := saved;
-  u := TUpvalInfo.Create;
+  u := TUpvalInfo(TUpvalInfo.NewInstance);
   Owner.Add(u);
   u.Name := name;
   u.ParentIdx := -1;
@@ -555,7 +593,7 @@ begin
   SingleVarAux(FS, EnvName, res, True);
   case res.Kind of
     rkGlobal:
-      SemError(Format('_ENV is global when accessing variable ''%s''', [name.ToStr]));
+      ErrName('_ENV is global when accessing variable ''%s''', name);
     rkLocal: begin
       env := NewExpr(ekLocal, line);
       env.Variable := res.Local;
@@ -574,7 +612,7 @@ begin
   Result.A := env;
   Result.B := key;
   Result.IsGlobal := True;
-  Result.DisplayName := name.ToStr;
+  Result.DisplayName := name;
 end;
 
 function TParser.BuildVar(name: TStringObj; line: Integer): TExpr;
@@ -589,24 +627,24 @@ begin
     rkLocal: begin
       Result := NewExpr(ekLocal, line);
       Result.Variable := res.Local;
-      Result.DisplayName := name.ToStr;
+      Result.DisplayName := name;
       Result.ReadOnly := res.Local.ReadOnly;
     end;
     rkUpval: begin
       Result := NewExpr(ekUpval, line);
       Result.UpIdx := res.UpIdx;
-      Result.DisplayName := name.ToStr;
+      Result.DisplayName := name;
       Result.ReadOnly := FS.Decl.Upvals[res.UpIdx].ReadOnly;
     end;
     rkConst: begin
       Result := ConstExpr(res.ConstVal, line);
       Result.ReadOnly := True;
-      Result.DisplayName := name.ToStr;
+      Result.DisplayName := name;
     end;
   else
     begin
       if res.GState = -2 then
-        SemError(Format('variable ''%s'' not declared', [name.ToStr]));
+        ErrName('variable ''%s'' not declared', name);
       Result := BuildGlobal(name, line);
       if (res.GState >= 0) and res.GConst then
         Result.ReadOnly := True;
@@ -636,7 +674,7 @@ begin
   // check repeated labels in the whole function
   for i := 0 to FS.NLabels - 1 do
     if FS.Labels[i].Name = name then
-      SemError(Format('label ''%s'' already defined on line %d', [name.ToStr, FS.Labels[i].Line]));
+      ErrLabelDup(name, FS.Labels[i].Line);
   if FS.NLabels >= Length(FS.Labels) then
     SetLength(FS.Labels, FS.NLabels * 2);
   FS.Labels[FS.NLabels].Name := name;
@@ -901,17 +939,18 @@ begin
   end;
 end;
 
-function TParser.ExprList: TExprArray;
+// (a procedure filling the caller's array: no managed temporaries, hence no exception frames)
+procedure TParser.ExprListInto(var res: TExprArray);
 var
   n: Integer;
 begin
   n := 1;
-  SetLength(Result, 1);
-  Result[0] := Expr;
+  SetLength(res, 1);
+  res[0] := Expr;
   while TestNext(tkComma) do
   begin
-    SetLength(Result, n + 1);
-    Result[n] := Expr;
+    SetLength(res, n + 1);
+    res[n] := Expr;
     Inc(n);
   end;
 end;
@@ -919,32 +958,9 @@ end;
 function TParser.FuncArgs(fn: TExpr; const method: TStringObj; isMethod: Boolean): TExpr;
 var
   line: Integer;
-  args: TExprArray;
   e: TExpr;
 begin
   line := Lex.Line;
-  args := nil;
-  case Lex.Tok of
-    tkLParen: begin
-      Next;
-      if Lex.Tok <> tkRParen then
-        args := ExprList;
-      CheckMatch(tkRParen, tkLParen, line);
-    end;
-    tkLBrace: begin
-      SetLength(args, 1);
-      args[0] := Constructor_;
-    end;
-    tkString: begin
-      e := NewExpr(ekStr, line);
-      e.StrVal := Lex.StrVal;
-      SetLength(args, 1);
-      args[0] := e;
-      Next;
-    end;
-  else
-    SyntaxError('function arguments expected');
-  end;
   if isMethod then
   begin
     Result := NewExpr(ekMethCall, line);
@@ -953,7 +969,27 @@ begin
   else
     Result := NewExpr(ekCall, line);
   Result.A := fn;
-  Result.Args := args;
+  case Lex.Tok of
+    tkLParen: begin
+      Next;
+      if Lex.Tok <> tkRParen then
+        ExprListInto(Result.Args);
+      CheckMatch(tkRParen, tkLParen, line);
+    end;
+    tkLBrace: begin
+      SetLength(Result.Args, 1);
+      Result.Args[0] := Constructor_;
+    end;
+    tkString: begin
+      e := NewExpr(ekStr, line);
+      e.StrVal := Lex.StrVal;
+      SetLength(Result.Args, 1);
+      Result.Args[0] := e;
+      Next;
+    end;
+  else
+    SyntaxError('function arguments expected');
+  end;
 end;
 
 function TParser.SuffixedExp: TExpr;
@@ -1098,14 +1134,14 @@ var
   v: TVarInfo;
   bl: TBlockScope;
 begin
-  decl := TFuncDecl.Create;
+  decl := TFuncDecl(TFuncDecl.NewInstance);
   Owner.Add(decl);
   decl.Parent := FS.Decl;
   decl.LineDefined := line;
   decl.IsMethod := isMethod;
   decl.Source := FS.Decl.Source;
   OpenFunc(decl);
-  decl.Body := TBlock.Create;
+  decl.Body := TBlock(TBlock.NewInstance);
   Owner.Add(decl.Body);
   EnterBlock(bl, False, decl.Body);
   CheckNext(tkLParen);
@@ -1219,7 +1255,7 @@ function TParser.ParseBlock: TBlock;
 var
   bl: TBlockScope;
 begin
-  Result := TBlock.Create;
+  Result := TBlock(TBlock.NewInstance);
   Owner.Add(Result);
   EnterBlock(bl, False, Result);
   StatList(Result);
@@ -1231,10 +1267,10 @@ begin
   case e.Kind of
     ekLocal, ekUpval, ekIndex:
       if e.ReadOnly then
-        SemError(Format('attempt to assign to const variable ''%s''', [e.DisplayName]));
+        ErrName('attempt to assign to const variable ''%s''', e.DisplayName);
     ekInt, ekFlt, ekStr, ekNil, ekTrue, ekFalse:
       if e.ReadOnly then
-        SemError(Format('attempt to assign to const variable ''%s''', [e.DisplayName]));
+        ErrName('attempt to assign to const variable ''%s''', e.DisplayName);
   end;
 end;
 
@@ -1245,12 +1281,12 @@ begin
   Result := def;
   if TestNext(tkLt) then
   begin
-    attr := Lex.NameVal;
+    attr := string(Lex.NameStr.Str);
     CheckName;
     CheckNext(tkGt);
     if attr = 'const' then Result := vkConst
     else if attr = 'close' then Result := vkClose
-    else SemError(Format('unknown attribute ''%s''', [attr]));
+    else ErrAttr(attr);
   end;
 end;
 
@@ -1301,7 +1337,7 @@ var
 begin
   Next;
   s := NewStmt(skWhile, line);
-  dummy := TBlock.Create;
+  dummy := TBlock(TBlock.NewInstance);
   Owner.Add(dummy);
   EnterBlock(bl, True, dummy);
   CurBlock^.Stmt := s;
@@ -1322,11 +1358,11 @@ var
   dummy: TBlock;
 begin
   s := NewStmt(skRepeat, line);
-  dummy := TBlock.Create;
+  dummy := TBlock(TBlock.NewInstance);
   Owner.Add(dummy);
   EnterBlock(bl1, True, dummy);     // loop block
   CurBlock^.Stmt := s;
-  s.Body := TBlock.Create;
+  s.Body := TBlock(TBlock.NewInstance);
   Owner.Add(s.Body);
   EnterBlock(bl2, False, s.Body);   // scope block
   Next;
@@ -1340,19 +1376,18 @@ begin
   AddStmt(blk, s);
 end;
 
-procedure TParser.ForBody(s: TStmt; var vars: TVarInfoArray; line: Integer);
+procedure TParser.ForBody(s: TStmt; line: Integer);
 var
   bl: TBlockScope;
   i: Integer;
   dummy: TBlock;
 begin
   CheckNext(tkDo);
-  dummy := TBlock.Create;
+  dummy := TBlock(TBlock.NewInstance);
   Owner.Add(dummy);
   EnterBlock(bl, False, dummy);     // scope for declared variables
-  for i := 0 to Length(vars) - 1 do
-    ActivateLocal(vars[i]);
-  s.Vars := vars;
+  for i := 0 to Length(s.Vars) - 1 do
+    ActivateLocal(s.Vars[i]);
   s.Body := ParseBlock;
   LeaveBlock;
 end;
@@ -1360,11 +1395,10 @@ end;
 procedure TParser.ForNum(s: TStmt; varname: TStringObj; line: Integer);
 var
   h1, h2, cv: TVarInfo;
-  vars: TVarInfoArray;
 begin
   s.Kind := skForNum;
-  h1 := NewLocal(L.NewString('(for state)'), vkRegular);
-  h2 := NewLocal(L.NewString('(for state)'), vkRegular);
+  h1 := NewLocal(ForStateName, vkRegular);
+  h2 := NewLocal(ForStateName, vkRegular);
   cv := NewLocal(varname, vkConst);   // control variable is read-only
   CheckNext(tkAssign);
   SetLength(s.Exprs, 2);
@@ -1381,35 +1415,34 @@ begin
   SetLength(s.Hidden, 2);
   s.Hidden[0] := h1;
   s.Hidden[1] := h2;
-  SetLength(vars, 1);
-  vars[0] := cv;
+  SetLength(s.Vars, 1);
+  s.Vars[0] := cv;
   s.EndLine := line;
-  ForBody(s, vars, line);
+  ForBody(s, line);
 end;
 
 procedure TParser.ForList(s: TStmt; indexname: TStringObj; line: Integer);
 var
   h1, h2, h3: TVarInfo;
-  vars: TVarInfoArray;
   n: Integer;
 begin
   s.Kind := skForIn;
-  h1 := NewLocal(L.NewString('(for state)'), vkRegular);
-  h2 := NewLocal(L.NewString('(for state)'), vkRegular);
-  h3 := NewLocal(L.NewString('(for state)'), vkClose);
-  SetLength(vars, 1);
-  vars[0] := NewLocal(indexname, vkConst);   // control variable
+  h1 := NewLocal(ForStateName, vkRegular);
+  h2 := NewLocal(ForStateName, vkRegular);
+  h3 := NewLocal(ForStateName, vkClose);
+  SetLength(s.Vars, 1);
+  s.Vars[0] := NewLocal(indexname, vkConst);   // control variable
   n := 1;
   while TestNext(tkComma) do
   begin
-    SetLength(vars, n + 1);
-    vars[n] := NewLocal(CheckName, vkRegular);
+    SetLength(s.Vars, n + 1);
+    s.Vars[n] := NewLocal(CheckName, vkRegular);
     Inc(n);
   end;
   CheckNext(tkIn);
   line := Lex.Line;   // calls to the iterator are reported at the line of the first expression
   s.Line := line;
-  s.Exprs := ExprList;
+  ExprListInto(s.Exprs);
   ActivateLocal(h1);
   ActivateLocal(h2);
   ActivateLocal(h3);
@@ -1418,7 +1451,7 @@ begin
   s.Hidden[1] := h2;
   s.Hidden[2] := h3;
   CurBlock^.InsideTbc := True;   // the closing value is to-be-closed
-  ForBody(s, vars, line);
+  ForBody(s, line);
 end;
 
 procedure TParser.ForStat(blk: TBlock; line: Integer);
@@ -1429,7 +1462,7 @@ var
   varname: TStringObj;
 begin
   s := NewStmt(skForNum, line);
-  dummy := TBlock.Create;
+  dummy := TBlock(TBlock.NewInstance);
   Owner.Add(dummy);
   EnterBlock(bl, True, dummy);
   CurBlock^.Stmt := s;
@@ -1505,7 +1538,6 @@ procedure TParser.LocalStat(blk: TBlock; line: Integer);
 var
   s: TStmt;
   defKind, kind: TVarKind;
-  vars: TVarInfoArray;
   nvars, i, toclose: Integer;
   last: TVarInfo;
   v: TLuaValue;
@@ -1516,10 +1548,10 @@ begin
   nvars := 0;
   toclose := -1;
   repeat
-    SetLength(vars, nvars + 1);
-    vars[nvars] := NewLocal(CheckName, vkRegular);
+    SetLength(s.Vars, nvars + 1);
+    s.Vars[nvars] := NewLocal(CheckName, vkRegular);
     kind := GetVarAttribute(defKind);
-    vars[nvars].Kind := kind;
+    s.Vars[nvars].Kind := kind;
     if kind = vkClose then
     begin
       if toclose <> -1 then
@@ -1529,9 +1561,9 @@ begin
     Inc(nvars);
   until not TestNext(tkComma);
   if TestNext(tkAssign) then
-    s.Exprs := ExprList;
+    ExprListInto(s.Exprs);
   s.EndLine := Lex.LastLine;
-  last := vars[nvars - 1];
+  last := s.Vars[nvars - 1];
   // compile-time constant?
   if (Length(s.Exprs) = nvars) and (last.Kind = vkConst) then
   begin
@@ -1552,9 +1584,8 @@ begin
       last.ConstVal := v;
     end;
   end;
-  s.Vars := vars;
   for i := 0 to nvars - 1 do
-    ActivateLocal(vars[i]);
+    ActivateLocal(s.Vars[i]);
   if toclose >= 0 then
     CurBlock^.InsideTbc := True;
   AddStmt(blk, s);
@@ -1582,7 +1613,7 @@ begin
     SetLength(s.Targets, n);
     for i := 0 to n - 1 do
       s.Targets[i] := BuildGlobal(names[i], line);
-    s.Exprs := ExprList;
+    ExprListInto(s.Exprs);
     s.CheckNil := True;
     s.EndLine := Lex.LastLine;
     AddStmt(blk, s);
@@ -1646,27 +1677,27 @@ procedure TParser.ExprStat(blk: TBlock; line: Integer);
 var
   s: TStmt;
   e: TExpr;
-  targets: TExprArray;
   n, i: Integer;
 begin
   e := SuffixedExp;
+  s := NewStmt(skAssign, line);
   if (Lex.Tok = tkAssign) or (Lex.Tok = tkComma) then
   begin
     n := 1;
-    SetLength(targets, 1);
-    targets[0] := e;
+    SetLength(s.Targets, 1);
+    s.Targets[0] := e;
     while True do
     begin
-      if not (targets[n - 1].Kind in [ekLocal, ekUpval, ekIndex, ekInt, ekFlt, ekStr, ekNil, ekTrue, ekFalse]) then
+      if not (s.Targets[n - 1].Kind in [ekLocal, ekUpval, ekIndex, ekInt, ekFlt, ekStr, ekNil, ekTrue, ekFalse]) then
         SyntaxError('syntax error');
-      CheckReadonly(targets[n - 1]);
-      if (targets[n - 1].Kind = ekIndex) and (targets[n - 1].A.Kind = ekLocal) and
-         (targets[n - 1].A.Variable.Kind = vkVarargParam) then
-        targets[n - 1].A.Variable.NeedTable := True;
+      CheckReadonly(s.Targets[n - 1]);
+      if (s.Targets[n - 1].Kind = ekIndex) and (s.Targets[n - 1].A.Kind = ekLocal) and
+         (s.Targets[n - 1].A.Variable.Kind = vkVarargParam) then
+        s.Targets[n - 1].A.Variable.NeedTable := True;
       if TestNext(tkComma) then
       begin
-        SetLength(targets, n + 1);
-        targets[n] := SuffixedExp;
+        SetLength(s.Targets, n + 1);
+        s.Targets[n] := SuffixedExp;
         Inc(n);
         EnterLevel;
       end
@@ -1675,9 +1706,7 @@ begin
     end;
     for i := 1 to n - 1 do LeaveLevel;
     CheckNext(tkAssign);
-    s := NewStmt(skAssign, line);
-    s.Targets := targets;
-    s.Exprs := ExprList;
+    ExprListInto(s.Exprs);
     s.EndLine := Lex.LastLine;
     AddStmt(blk, s);
   end
@@ -1685,7 +1714,7 @@ begin
   begin
     if not (e.Kind in [ekCall, ekMethCall]) then
       SyntaxError('syntax error');
-    s := NewStmt(skCall, line);
+    s.Kind := skCall;
     SetLength(s.Exprs, 1);
     s.Exprs[0] := e;
     s.EndLine := Lex.LastLine;
@@ -1699,7 +1728,7 @@ var
 begin
   s := NewStmt(skReturn, line);
   if not (BlockFollow(True) or (Lex.Tok = tkSemi)) then
-    s.Exprs := ExprList;
+    ExprListInto(s.Exprs);
   s.TailCall := (Length(s.Exprs) = 1) and (s.Exprs[0].Kind in [ekCall, ekMethCall]) and
                 not CurBlock^.InsideTbc;
   TestNext(tkSemi);
@@ -1760,7 +1789,7 @@ begin
           found := True;
           s := NewStmt(skBreak, line);
           s.BreakTarget := FS.Blocks[i].Stmt;
-          s.Vars := ActiveRegVars(FS);
+          ActiveRegVarsInto(FS, s.Vars);
           s.NActVar := RegLevel(FS, FS.Blocks[i].NAct);
           Break;
         end;
@@ -1774,13 +1803,13 @@ begin
       name := CheckName;
       s := NewStmt(skGoto, line);
       s.LabelName := name;
-      s.Vars := ActiveRegVars(FS);
+      ActiveRegVarsInto(FS, s.Vars);
       NewGoto(name, line, s);
       AddStmt(blk, s);
     end;
   else
     begin
-      if (Lex.Tok = tkName) and (Lex.NameVal = 'global') then
+      if (Lex.Tok = tkName) and Lex.NameIs('global') then
       begin
         look := Lex.LookAhead;
         if (look = tkLt) or (look = tkName) or (look = tkStar) or (look = tkFunction) then
@@ -1802,17 +1831,17 @@ var
   u: TUpvalInfo;
   bl: TBlockScope;
 begin
-  decl := TFuncDecl.Create;
+  decl := TFuncDecl(TFuncDecl.NewInstance);
   Owner.Add(decl);
   decl.IsVararg := True;
   decl.LineDefined := 0;
   decl.Source := nil;
   OpenFunc(decl);
-  decl.Body := TBlock.Create;
+  decl.Body := TBlock(TBlock.NewInstance);
   Owner.Add(decl.Body);
   EnterBlock(bl, False, decl.Body);
   // the environment upvalue
-  u := TUpvalInfo.Create;
+  u := TUpvalInfo(TUpvalInfo.NewInstance);
   Owner.Add(u);
   u.Name := EnvName;
   u.ParentIdx := -1;
@@ -1828,11 +1857,11 @@ begin
 end;
 
 function ParseChunk(L: TLua; const source: RawByteString; const chunkName: string;
-                    out owner: TObjectList): TFuncDecl;
+                    out owner: TAstOwner): TFuncDecl;
 var
   p: TParser;
 begin
-  owner := TObjectList.Create(True);
+  owner := TAstOwner.Create;
   try
     p := TParser.Create(L, source, chunkName, owner);
     try

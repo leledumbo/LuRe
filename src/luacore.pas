@@ -43,16 +43,25 @@ type
   PLuaValue = ^TLuaValue;
 
 
-  TGCObject = class
+  // objects that come from size-class free lists instead of the general heap.
+  // Create them with Cls.NewInstance (not Cls.Create: the RTL's TObject.Create sets up an
+  // exception frame for every object)
+  TPooledObject = class
+  public
+    class function NewInstance: TObject; override;
+    procedure FreeInstance; override;
+    // returns the memory to its pool WITHOUT finalizing managed fields (the subclass
+    // has released them itself)
+    procedure ReleaseRaw;
+  end;
+
+  TGCObject = class(TPooledObject)
   public
     NextGC: TGCObject;
     ObjType: Byte;
     Marked: Boolean;
     Fixed: Boolean;      // never collected
     FinState: Byte;      // 0: no finalizer; 1: registered for finalization
-    // collectable objects come from size-class free lists instead of the general heap
-    class function NewInstance: TObject; override;
-    procedure FreeInstance; override;
   end;
 
   // ---------------- strings ----------------
@@ -475,7 +484,7 @@ var
   PoolChunk: PByte = nil;
   PoolLeft: SizeInt = 0;
 
-class function TGCObject.NewInstance: TObject;
+class function TPooledObject.NewInstance: TObject;
 var
   cls, sz: SizeInt;
   p: Pointer;
@@ -501,7 +510,7 @@ begin
   Result := InitInstance(p);
 end;
 
-procedure TGCObject.FreeInstance;
+procedure TPooledObject.FreeInstance;
 var
   cls: SizeInt;
 begin
@@ -512,6 +521,20 @@ begin
     Exit;
   end;
   CleanupInstance;
+  PPointer(Pointer(Self))^ := PoolFree[cls];
+  PoolFree[cls] := Pointer(Self);
+end;
+
+procedure TPooledObject.ReleaseRaw;
+var
+  cls: SizeInt;
+begin
+  cls := (InstanceSize + 15) shr 4;
+  if cls >= POOL_CLASSES then
+  begin
+    inherited FreeInstance;
+    Exit;
+  end;
   PPointer(Pointer(Self))^ := PoolFree[cls];
   PoolFree[cls] := Pointer(Self);
 end;
@@ -658,7 +681,7 @@ end;
 // a string object whose characters are copied from p
 function MakeString(p: PByte; n: SizeUInt): TStringObj;
 begin
-  Result := TStringObj.Create;
+  Result := TStringObj(TStringObj.NewInstance);
   Result.ObjType := OBJ_STR;
   Result.Len := n;
   Result.Bytes := BlockAlloc(n + 1);
@@ -1978,7 +2001,7 @@ end;
 
 function TLua.NewTable(nArr, nRec: Integer): TTable;
 begin
-  Result := TTable.Create;
+  Result := TTable(TTable.NewInstance);
   Result.ObjType := OBJ_TAB;
   RegisterObject(Result, 80);
   if (nArr > 0) or (nRec > 0) then
@@ -1987,7 +2010,7 @@ end;
 
 function TLua.NewUserdata(len: SizeUInt): TUserdata;
 begin
-  Result := TUserdata.Create;
+  Result := TUserdata(TUserdata.NewInstance);
   Result.ObjType := OBJ_USER;
   Result.UsrValue.Vt := vtNil;
   if len > 0 then
@@ -2001,7 +2024,7 @@ end;
 
 function TLua.NewProto: TProto;
 begin
-  Result := TProto.Create;
+  Result := TProto(TProto.NewInstance);
   Result.ObjType := OBJ_PROTO;
   Result.MaxStackSize := 2;
   Result.VarTabReg := -1;
@@ -2010,7 +2033,7 @@ end;
 
 function TLua.NewLuaFunction(p: TProto): TFunction;
 begin
-  Result := TFunction.Create;
+  Result := TFunction(TFunction.NewInstance);
   Result.ObjType := OBJ_FUNC;
   Result.Proto := p;
   SetLength(Result.Upvals, Length(p.UpvalDescs));
@@ -2021,7 +2044,7 @@ function TLua.NewCFunction(f: TCFunc; nvals: Integer): TFunction;
 var
   i: Integer;
 begin
-  Result := TFunction.Create;
+  Result := TFunction(TFunction.NewInstance);
   Result.ObjType := OBJ_FUNC;
   Result.IsC := True;
   Result.CProc := f;
@@ -2032,7 +2055,7 @@ end;
 
 function TLua.NewUpval: TUpval;
 begin
-  Result := TUpval.Create;
+  Result := TUpval(TUpval.NewInstance);
   Result.ObjType := OBJ_UPVAL;
   Result.Idx := -1;
   Result.P := @Result.V;

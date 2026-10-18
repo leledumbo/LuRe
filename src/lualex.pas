@@ -29,7 +29,7 @@ type
     Str: TStringObj;
     Int: Int64;
     Flt: Double;
-    Name: string;
+    Name: TStringObj;      // identifiers (interned)
     Ch: Char;              // for tkOther
     First, Last: Integer;  // source range of the token text
   end;
@@ -45,7 +45,7 @@ type
     StrVal: TStringObj;
     IntVal: Int64;
     FltVal: Double;
-    NameVal: string;
+    NameStr: TStringObj;   // the current identifier (interned)
     constructor Create(AL: TLua; const ASource: RawByteString; const AChunkId: string);
     destructor Destroy; override;
     procedure Next;
@@ -59,13 +59,14 @@ type
     // description of the current token for "near" parts of messages
     function CurTokenText: string;
     function NewStr(const s: RawByteString): TStringObj;
+    function NameIs(const s: string): Boolean;   // is the current identifier 's'?
   private
     Source: RawByteString;
     Len: Integer;
     Pos: Integer;
     CurCh: Char;
-    Buf: RawByteString;
-    BufLen: Integer;
+    Buf: PByte;          // characters of the token being scanned
+    BufLen, BufCap: Integer;
     Cur: TToken;
     Ahead: TToken;
     HasAhead: Boolean;
@@ -76,6 +77,9 @@ type
     function AtEof: Boolean; inline;
     procedure IncLineNumber;
     function BufText: string;
+    function NewStrBuf(p: PByte; n: SizeUInt): TStringObj;
+    function NewLongStr(p: PByte; n: SizeUInt): TStringObj;
+    procedure ConvertNumeral(var t: TToken);
     function TokenText(const t: TToken): string;
     procedure LexError(const msg: string; tk: TTokenKind);
     procedure Scan(var t: TToken);
@@ -103,6 +107,33 @@ const
     '..', '...', '==', '~=', '<=', '>=', '<', '>', '=',
     '(', ')', '{', '}', '[', ']', '::', ';', ':', ',', '.');
 
+var
+  KwFirst, KwLast: array['a'..'w'] of TTokenKind;
+  KwLen: array[tkAnd..tkWhile] of Integer;
+
+procedure InitKeywordTables;
+var
+  k: TTokenKind;
+  c: Char;
+begin
+  for c := 'a' to 'w' do
+  begin
+    KwFirst[c] := tkWhile;
+    KwLast[c] := tkAnd;      // empty range: KwFirst > KwLast
+  end;
+  for k := tkWhile downto tkAnd do
+  begin
+    KwLen[k] := Length(ReservedWords[k]);
+    c := ReservedWords[k][1];
+    KwFirst[c] := k;
+  end;
+  for k := tkAnd to tkWhile do
+  begin
+    c := ReservedWords[k][1];
+    KwLast[c] := k;
+  end;
+end;
+
 constructor TLexer.Create(AL: TLua; const ASource: RawByteString; const AChunkId: string);
 begin
   L := AL;
@@ -113,7 +144,8 @@ begin
   Line := 1;
   LastLine := 1;
   HasAhead := False;
-  SetLength(Buf, 64);
+  BufCap := 256;
+  Buf := GetMem(BufCap);
   BufLen := 0;
   LongStrs := specialize TDictionary<RawByteString, TStringObj>.Create;
   if Len > 0 then CurCh := Source[1] else CurCh := #0;
@@ -122,6 +154,7 @@ end;
 
 destructor TLexer.Destroy;
 begin
+  FreeMem(Buf);
   LongStrs.Free;
   inherited Destroy;
 end;
@@ -153,10 +186,13 @@ end;
 
 procedure TLexer.Save(c: Char);
 begin
-  if BufLen >= Length(Buf) then
-    SetLength(Buf, Length(Buf) * 2);
+  if BufLen >= BufCap then
+  begin
+    BufCap := BufCap * 2;
+    ReallocMem(Buf, BufCap);
+  end;
+  Buf[BufLen] := Byte(c);
   Inc(BufLen);
-  Buf[BufLen] := c;
 end;
 
 procedure TLexer.SaveAndNext;
@@ -166,8 +202,37 @@ begin
 end;
 
 function TLexer.BufText: string;
+var
+  r: RawByteString;
 begin
-  Result := string(Copy(Buf, 1, BufLen));
+  SetString(r, PAnsiChar(Buf), BufLen);
+  Result := string(r);
+end;
+
+function TLexer.NewLongStr(p: PByte; n: SizeUInt): TStringObj;
+var
+  key: RawByteString;
+begin
+  SetString(key, PAnsiChar(p), n);
+  if not LongStrs.TryGetValue(key, Result) then
+  begin
+    Result := L.NewStringBuf(p, n);
+    LongStrs.Add(key, Result);
+  end;
+end;
+
+// a string for the characters in the buffer; long ones with the same content
+// share one object within a chunk
+function TLexer.NewStrBuf(p: PByte; n: SizeUInt): TStringObj;
+begin
+  if n > LUA_MAXSHORTLEN then Result := NewLongStr(p, n)
+  else Result := L.NewStringBuf(p, n);
+end;
+
+function TLexer.NameIs(const s: string): Boolean;
+begin
+  Result := (NameStr <> nil) and (NameStr.Len = SizeUInt(Length(s))) and
+            ((Length(s) = 0) or CompareMem(NameStr.Data, @s[1], Length(s)));
 end;
 
 procedure TLexer.IncLineNumber;
@@ -297,7 +362,7 @@ begin
     end;
   end;
   if isString then
-    t.Str := NewStr(Copy(Buf, 1 + sep, BufLen - 2 * sep));
+    t.Str := NewStrBuf(Buf + sep, BufLen - 2 * sep);
 end;
 
 procedure TLexer.EscCheck(ok: Boolean; const msg: string);
@@ -448,41 +513,16 @@ begin
     end;
   end;
   SaveAndNext;  // skip closing delimiter
-  t.Str := NewStr(Copy(Buf, 2, BufLen - 2));
+  t.Str := NewStrBuf(Buf + 1, BufLen - 2);
 end;
 
-procedure TLexer.ReadNumeral(var t: TToken);
+procedure TLexer.ConvertNumeral(var t: TToken);
 var
-  expo: string;
   iv: Int64;
   fv: Double;
   txt: RawByteString;
 begin
-  expo := 'Ee';
-  if CurCh = '0' then
-  begin
-    SaveAndNext;
-    if CurCh in ['x', 'X'] then
-    begin
-      expo := 'Pp';
-      SaveAndNext;
-    end;
-  end;
-  while True do
-  begin
-    if (CurCh <> #0) and (System.Pos(CurCh, expo) > 0) then
-    begin
-      SaveAndNext;
-      if CurCh in ['+', '-'] then SaveAndNext;
-    end
-    else if CurCh in ['0'..'9', 'a'..'f', 'A'..'F', '.'] then
-      SaveAndNext
-    else
-      Break;
-  end;
-  if CurCh in ['a'..'z', 'A'..'Z', '_'] then
-    SaveAndNext;  // force an error
-  txt := Copy(Buf, 1, BufLen);
+  SetString(txt, PAnsiChar(Buf), BufLen);
   if StrToIntVal(txt, iv) then
   begin
     t.Kind := tkInt;
@@ -497,17 +537,75 @@ begin
     LexError('malformed number', tkFlt);
 end;
 
+procedure TLexer.ReadNumeral(var t: TToken);
+var
+  hex: Boolean;
+  i: Integer;
+  iv: Int64;
+begin
+  hex := False;
+  if CurCh = '0' then
+  begin
+    SaveAndNext;
+    if CurCh in ['x', 'X'] then
+    begin
+      hex := True;
+      SaveAndNext;
+    end;
+  end;
+  while True do
+  begin
+    if (CurCh <> #0) and ((hex and (CurCh in ['P', 'p'])) or ((not hex) and (CurCh in ['E', 'e']))) then
+    begin
+      SaveAndNext;
+      if CurCh in ['+', '-'] then SaveAndNext;
+    end
+    else if CurCh in ['0'..'9', 'a'..'f', 'A'..'F', '.'] then
+      SaveAndNext
+    else
+      Break;
+  end;
+  if CurCh in ['a'..'z', 'A'..'Z', '_'] then
+    SaveAndNext;  // force an error
+  // plain decimal integers (the common case) are converted without temporaries
+  if (BufLen <= 18) and (BufLen > 0) then
+  begin
+    iv := 0;
+    i := 0;
+    while (i < BufLen) and (Buf[i] >= Ord('0')) and (Buf[i] <= Ord('9')) do
+    begin
+      iv := iv * 10 + (Buf[i] - Ord('0'));
+      Inc(i);
+    end;
+    if i = BufLen then
+    begin
+      t.Kind := tkInt;
+      t.Int := iv;
+      Exit;
+    end;
+  end;
+  ConvertNumeral(t);
+end;
+
 procedure TLexer.Scan(var t: TToken);
 var
-  sep: Integer;
+  sep, idStart, idLen, i: Integer;
   c: Char;
   k: TTokenKind;
 begin
   t.Str := nil;
-  t.Name := '';
+  t.Name := nil;
   BufLen := 0;
   while True do
   begin
+    // blanks are skipped in a tight loop on a local index
+    i := Pos;
+    while (i <= Len) and (Source[i] in [' ', #9, #11, #12]) do Inc(i);
+    if i <> Pos then
+    begin
+      Pos := i;
+      if i <= Len then CurCh := Source[i] else CurCh := #0;
+    end;
     t.First := Pos;
     if AtEof then
     begin
@@ -632,18 +730,26 @@ begin
         end;
       'a'..'z', 'A'..'Z', '_':
         begin
-          repeat
-            SaveAndNext;
-          until not (CurCh in ['a'..'z', 'A'..'Z', '_', '0'..'9']);
-          t.Name := BufText;
+          idStart := Pos;
+          i := Pos + 1;
+          while (i <= Len) and (Source[i] in ['a'..'z', 'A'..'Z', '_', '0'..'9']) do Inc(i);
+          Pos := i;
+          if i <= Len then CurCh := Source[i] else CurCh := #0;
+          idLen := Pos - idStart;
           t.Kind := tkName;
-          for k := tkAnd to tkWhile do
-            if (ReservedWords[k][1] = t.Name[1]) and (Length(ReservedWords[k]) = Length(t.Name)) and
-               (ReservedWords[k] = t.Name) and (k <> tkGlobal) then  // 'global' is contextual
-            begin
-              t.Kind := k;
-              Break;
-            end;
+          if (idLen >= 2) and (idLen <= 8) and (Source[idStart] in ['a'..'w']) then
+          begin
+            // the reserved words are sorted: only those with the same first letter can match
+            for k := KwFirst[Source[idStart]] to KwLast[Source[idStart]] do
+              if (KwLen[k] = idLen) and (CompareByte(ReservedWords[k][1], Source[idStart], idLen) = 0) and
+                 (k <> tkGlobal) then  // 'global' is contextual
+              begin
+                t.Kind := k;
+                Break;
+              end;
+          end;
+          if t.Kind = tkName then
+            t.Name := NewStrBuf(PByte(Pointer(Source)) + (idStart - 1), idLen);
           Break;
         end;
       '+': begin Advance; t.Kind := tkPlus; Break; end;
@@ -686,7 +792,7 @@ begin
   StrVal := Cur.Str;
   IntVal := Cur.Int;
   FltVal := Cur.Flt;
-  NameVal := Cur.Name;
+  NameStr := Cur.Name;
 end;
 
 function TLexer.LookAhead: TTokenKind;
@@ -698,5 +804,8 @@ begin
   end;
   Result := Ahead.Kind;
 end;
+
+initialization
+  InitKeywordTables;
 
 end.

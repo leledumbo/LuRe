@@ -12,6 +12,21 @@ uses
   SysUtils, luacore;
 
 type
+  // syntax tree nodes: pooled, owned by a TAstOwner and freed all together
+  TAstNode = class(TPooledObject)
+  public
+    procedure FreeInstance; override;
+  end;
+
+  TAstOwner = class
+  private
+    Items: array of TObject;
+    Count: Integer;
+  public
+    procedure Add(o: TObject); inline;
+    destructor Destroy; override;
+  end;
+
   TVarKind = (
     vkRegular,      // ordinary local
     vkConst,        // <const>
@@ -24,7 +39,7 @@ type
   TVarInfoArray = array of TVarInfo;
 
   // a local variable (user declared or internal)
-  TVarInfo = class(TObject)
+  TVarInfo = class(TAstNode)
   public
     Name: TStringObj;
     Kind: TVarKind;
@@ -36,7 +51,7 @@ type
     function ReadOnly: Boolean;
   end;
 
-  TUpvalInfo = class
+  TUpvalInfo = class(TAstNode)
   public
     Name: TStringObj;
     FromLocal: TVarInfo;   // captures a local of the enclosing function...
@@ -67,7 +82,7 @@ type
 
   TExprArray = array of TExpr;
 
-  TExpr = class
+  TExpr = class(TAstNode)
   public
     Kind: TExprKind;
     Line: Integer;          // line used for the main instruction of the node
@@ -83,8 +98,9 @@ type
     UpIdx: Integer;         // ekUpval
     IsGlobal: Boolean;      // ekIndex written as a global name
     ReadOnly: Boolean;      // assignment target that cannot be assigned
-    DisplayName: string;    // variable name for messages
+    DisplayName: TStringObj; // variable name for messages
     EndLine: Integer;       // last line (tables, functions)
+    destructor Destroy; override;
   end;
 
   TBlock = class;
@@ -93,7 +109,7 @@ type
     skLocal, skAssign, skCall, skDo, skWhile, skRepeat, skIf, skForNum,
     skForIn, skLocalFunc, skReturn, skBreak, skGoto, skLabel);
 
-  TStmt = class
+  TStmt = class(TAstNode)
   public
     Kind: TStmtKind;
     Line: Integer;
@@ -115,18 +131,20 @@ type
     BreakTarget: TStmt;            // for 'break': the loop statement
     TailCall: Boolean;
     CheckNil: Boolean;             // global declaration with initializer: target must be nil
+    destructor Destroy; override;
   end;
 
-  TBlock = class
+  TBlock = class(TAstNode)
   public
     Stmts: array of TStmt;
     HasTbc: Boolean;
     HasUpvals: Boolean;
     NActVarStart: Integer;
     LastLine: Integer;      // line of the last token of the block
+    destructor Destroy; override;
   end;
 
-  TFuncDecl = class
+  TFuncDecl = class(TAstNode)
   public
     Parent: TFuncDecl;
     Params: array of TVarInfo;
@@ -139,9 +157,60 @@ type
     RetLine: Integer;       // line of the implicit final return
     IsMethod: Boolean;
     Source: TStringObj;
+    destructor Destroy; override;
   end;
 
 implementation
+
+procedure TAstNode.FreeInstance;
+begin
+  ReleaseRaw;   // the destructors below release the dynamic arrays
+end;
+
+procedure TAstOwner.Add(o: TObject);
+begin
+  if Count >= Length(Items) then SetLength(Items, Length(Items) * 2 + 256);
+  Items[Count] := o;
+  Inc(Count);
+end;
+
+destructor TAstOwner.Destroy;
+var
+  i: Integer;
+begin
+  for i := Count - 1 downto 0 do Items[i].Free;
+  inherited Destroy;
+end;
+
+destructor TExpr.Destroy;
+begin
+  Args := nil;
+  Fields := nil;
+  inherited Destroy;
+end;
+
+destructor TStmt.Destroy;
+begin
+  Vars := nil;
+  Targets := nil;
+  Exprs := nil;
+  Blocks := nil;
+  Hidden := nil;
+  inherited Destroy;
+end;
+
+destructor TBlock.Destroy;
+begin
+  Stmts := nil;
+  inherited Destroy;
+end;
+
+destructor TFuncDecl.Destroy;
+begin
+  Params := nil;
+  Upvals := nil;
+  inherited Destroy;
+end;
 
 function TVarInfo.ReadOnly: Boolean;
 begin

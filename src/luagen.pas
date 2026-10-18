@@ -26,8 +26,6 @@ const
 
 type
   TJumpList = array of Integer;
-  TStrMap = specialize TDictionary<RawByteString, Integer>;
-  TIntMap = specialize TDictionary<Int64, Integer>;
 
   TLoopCtx = record
     Stmt: TStmt;
@@ -56,8 +54,7 @@ type
     NCode: Integer;
     K: array of TLuaValue;
     NK: Integer;
-    KStrs: TStrMap;
-    KInts, KFlts: TIntMap;
+    KMap: array of Integer;      // open-addressing hash of the constants (index + 1, 0 = empty)
     KNil, KTrue, KFalse: Integer;
     Protos: array of TProto;
     NProtos: Integer;
@@ -93,6 +90,8 @@ type
     // registers & constants
     function AllocReg: Integer;
     procedure ReserveTo(n: Integer);
+    function FindK(constref v: TLuaValue; h: Cardinal): Integer;
+    procedure InsertK(idx: Integer; h: Cardinal);
     function AddK(constref v: TLuaValue): Integer;
     function KStr(s: TStringObj): Integer;
     function KOf(e: TExpr): Integer;
@@ -145,9 +144,7 @@ begin
   SetLength(Code, 64);
   SetLength(Lines, 64);
   SetLength(K, 16);
-  KStrs := TStrMap.Create;
-  KInts := TIntMap.Create;
-  KFlts := TIntMap.Create;
+  SetLength(KMap, 32);
   KNil := -1;
   KTrue := -1;
   KFalse := -1;
@@ -163,9 +160,6 @@ end;
 
 destructor TFuncGen.Destroy;
 begin
-  KStrs.Free;
-  KInts.Free;
-  KFlts.Free;
   inherited Destroy;
 end;
 
@@ -262,7 +256,65 @@ begin
   FreeReg := n;
 end;
 
+function KeyHashOf(constref v: TLuaValue): Cardinal;
+begin
+  case v.Vt of
+    vtInt: Result := Cardinal((QWord(v.I) * QWord($9E3779B97F4A7C15)) shr 32);
+    vtFlt: Result := Cardinal((QWord(PInt64(@v.N)^) * QWord($9E3779B97F4A7C15)) shr 32);
+  else
+    Result := v.S.GetHash;
+  end;
+end;
+
+// index of the constant equal to v (same type and, for floats, same bits), or -1
+function TFuncGen.FindK(constref v: TLuaValue; h: Cardinal): Integer;
+var
+  i, e: Integer;
+begin
+  i := Integer(h and Cardinal(Length(KMap) - 1));
+  while True do
+  begin
+    e := KMap[i];
+    if e = 0 then Exit(-1);
+    Dec(e);
+    if K[e].Vt = v.Vt then
+      case v.Vt of
+        vtInt: if K[e].I = v.I then Exit(e);
+        vtFlt: if PInt64(@K[e].N)^ = PInt64(@v.N)^ then Exit(e);
+        vtStr: if (K[e].S = v.S) or K[e].S.Eq(v.S) then Exit(e);
+      end;
+    i := (i + 1) and (Length(KMap) - 1);
+  end;
+end;
+
+procedure TFuncGen.InsertK(idx: Integer; h: Cardinal);
+var
+  i, j, e: Integer;
+  old: array of Integer;
+begin
+  if (NK + 1) * 2 > Length(KMap) then
+  begin
+    // grow and re-insert everything (the new constant is added by the caller's index below)
+    old := KMap;
+    SetLength(KMap, Length(old) * 2);
+    for j := 0 to High(KMap) do KMap[j] := 0;
+    for j := 0 to High(old) do
+      if old[j] <> 0 then
+      begin
+        e := old[j] - 1;
+        i := Integer(KeyHashOf(K[e]) and Cardinal(Length(KMap) - 1));
+        while KMap[i] <> 0 do i := (i + 1) and (Length(KMap) - 1);
+        KMap[i] := e + 1;
+      end;
+  end;
+  i := Integer(h and Cardinal(Length(KMap) - 1));
+  while KMap[i] <> 0 do i := (i + 1) and (Length(KMap) - 1);
+  KMap[i] := idx + 1;
+end;
+
 function TFuncGen.AddK(constref v: TLuaValue): Integer;
+var
+  h: Cardinal;
 
   function NewK: Integer;
   begin
@@ -290,24 +342,15 @@ begin
         Result := KFalse;
       end;
     end;
-    vtInt:
-      if not KInts.TryGetValue(v.I, Result) then
+    vtInt, vtFlt, vtStr: begin
+      h := KeyHashOf(v);
+      Result := FindK(v, h);
+      if Result < 0 then
       begin
         Result := NewK;
-        KInts.Add(v.I, Result);
+        InsertK(Result, h);
       end;
-    vtFlt:
-      if not KFlts.TryGetValue(PInt64(@v.N)^, Result) then
-      begin
-        Result := NewK;
-        KFlts.Add(PInt64(@v.N)^, Result);
-      end;
-    vtStr:
-      if not KStrs.TryGetValue(v.S.Str, Result) then
-      begin
-        Result := NewK;
-        KStrs.Add(v.S.Str, Result);
-      end;
+    end;
   else
     Result := NewK;
   end;
