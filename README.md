@@ -13,3 +13,9 @@ The implementation will not be a direct file to file conversion and instead, wri
 The current interpreter is working somewhat, but is extremely slow due to compliance first focus. Once it's fully compliant, the target can shift
 to performance while keeping what modern Pascal implementation works best at: memory utilization. In the era of high memory price, it's the one
 that can save your budget.
+
+## Claude intervention
+After $20, it doesn't even have the complete parser. Heck, the parser doesn't even produce AST. Looks like it takes my expectation a bit too blatantly,
+i.e. it builds to pass the test suite and what it sees is what is being tested, not to complete the language implementation first. A colleague then
+offers his Claude, Sonnet 5.5 rearchitecture and complete the parser with AST correctly. It is now fairly complete and passes most of the tests, including
+the one that the reference implementation skips unless the interpreter is build with internal tools flags (ltests).

@@ -1,4 +1,3 @@
+/bin/*
+/units/*
 /lua*/
-*.o
-*.ppu
-*.res

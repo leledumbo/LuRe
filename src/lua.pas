@@ -2,462 +2,591 @@ program lua;
 
 {$mode objfpc}{$H+}
 
+// The stand-alone interpreter (same behaviour as the reference 'lua' program).
+
 uses
-  SysUtils, Math, luacore, luaparse, luavm, lualib;
+  {$ifdef unix}cthreads,{$endif}
+  SysUtils, Classes, Math, luacore, luavm, luaaux, luaparse, lualibbase, lualibos,
+  lualibdbg, lualib;
 
-function libc_isatty(fd: Integer): Integer; cdecl; external 'c' name 'isatty';
+function c_isatty(fd: Integer): Integer; cdecl; external 'c' name 'isatty';
+function c_signal(sig: Integer; handler: Pointer): Pointer; cdecl; external 'c' name 'signal';
+function c_dlopen(name: PChar; flags: Integer): Pointer; cdecl; external 'c' name 'dlopen';
+function c_fputs(s: PChar; stream: Pointer): Integer; cdecl; external 'c' name 'fputs';
+function c_fflush(stream: Pointer): Integer; cdecl; external 'c' name 'fflush';
+function c_fgets(buf: PChar; n: Integer; stream: Pointer): PChar; cdecl; external 'c' name 'fgets';
+var
+  c_stderr: Pointer; external name 'stderr';
+  c_stdin: Pointer; external name 'stdin';
+
+const
+  LuaCopyright = 'Lua 5.5.1  Copyright (C) 1994-2026 Lua.org, PUC-Rio';
+  MAIN_STACK_SIZE = 768 * 1024 * 1024;
 
 var
-  MainL: TLua;
   ProgName: string = 'lua';
-  HasError: Boolean = False;
-  scriptArgs: array of string;
-  pt: TTable;
-  argt: TLuaValue;
-  preScriptIdx: Integer;
-  sopt: string;
-  interactive: Boolean;
+  Args: array of string;
+  ExitStatus: Integer = 0;
+  Done: PRTLEvent;
+  GlobalL: TLua;
 
-function StrToLua(const s: string): TLuaValue;
+procedure WriteErr(const s: string);
 begin
-  Result := LuaStr(MainL.NewString(RawByteString(s)));
+  c_fputs(PChar(s), c_stderr);
+  c_fflush(c_stderr);
 end;
 
-procedure PrintVersion;
+procedure PrintUsage(const badoption: string);
 begin
-  WriteLn('Lua 5.5.1  Copyright (C) 1994-2026 Lua.org, PUC-Rio');
+  WriteErr(ProgName + ': ');
+  if (Length(badoption) > 1) and (badoption[2] in ['e', 'l']) then
+    WriteErr(Format('''%s'' needs argument'#10, [badoption]))
+  else
+    WriteErr(Format('unrecognized option ''%s'''#10, [badoption]));
+  WriteErr(Format(
+    'usage: %s [options] [script [args]]'#10 +
+    'Available options are:'#10 +
+    '  -e stat   execute string ''stat'''#10 +
+    '  -i        enter interactive mode after executing ''script'''#10 +
+    '  -l mod    require library ''mod'' into global ''mod'''#10 +
+    '  -l g=mod  require library ''mod'' into global ''g'''#10 +
+    '  -v        show version information'#10 +
+    '  -E        ignore environment variables'#10 +
+    '  -W        turn warnings on'#10 +
+    '  --        stop handling options'#10 +
+    '  -         stop handling options and execute stdin'#10, [ProgName]));
 end;
 
-procedure PrintUsage;
+procedure Message(const pname, msg: string);
 begin
-  WriteLn('usage: ', ProgName, ' [options] [script [args]]');
-  WriteLn('Available options are:');
-  WriteLn('  -e stat   execute string ''stat''');
-  WriteLn('  -i        enter interactive mode after executing ''script''');
-  WriteLn('  -l mod    require library ''mod'' into global ''mod''');
-  WriteLn('  -l g=mod  require library ''mod'' into global ''g''');
-  WriteLn('  -v        show version information');
-  WriteLn('  -E        ignore environment variables');
-  WriteLn('  --        stop handling options');
-  WriteLn('  -         stop handling options and execute stdin');
+  if pname <> '' then WriteErr(pname + ': ');
+  WriteErr(msg + #10);
 end;
 
-procedure RunChunk(const src: string; const name: string);
+// reports the error value on the stack top; returns the status
+function Report(L: TLua; status: Integer): Integer;
 var
-  f: TFunction;
-  uv: TUpval;
+  v: TLuaValue;
+  msg: string;
 begin
-  f := LuaCompile(MainL, RawByteString(src), name);
-  uv := TUpval.Create;
-  uv.V := LuaTab(MainL.GlobalT);
-  f.Upvals[0] := uv;
-  argt := TableGetStr(MainL.GlobalT, MainL.NewString('arg'));
-  if (argt.Vt <> vtNil) and (argt.Vt <> vtTab) then
+  if status <> 0 then
   begin
-    WriteLn(ErrOutput, '''arg'' is not a table');
-    Halt(1);
+    v := L.Stack[L.Top - 1];
+    if v.Vt = vtStr then msg := string(v.S.Str)
+    else if v.Vt in [vtInt, vtFlt] then msg := NumToStr(v)
+    else msg := '(error message not a string)';
+    Message(ProgName, msg);
+    Dec(L.Top);
   end;
-  if argt.Vt = vtTab then
-  begin
-    f.VarArgTable := argt.T;
-    f.VarArgPreset := True;
-  end;
-  MainL.PushValue(LuaFunc(f));
-  try
-    LuaCall(MainL, 0, 0);
-  except
-    on E: ELuaError do
-    begin
-      HasError := True;
-      WriteLn(ErrOutput, E.Message);
-      MainL.Top := 0;
-    end;
-  end;
+  Result := status;
 end;
 
-procedure RunFile(const name: string; args: array of string);
+function MsgHandler(L: TLua): Integer;
 var
-  f: TFunction;
-  content: RawByteString;
-  fs: File;
-  buf: array[0..8191] of Byte;
-  n: Integer;
-  uv: TUpval;
-  i: Integer;
+  v, tm: TLuaValue;
+  msg: RawByteString;
 begin
-  AssignFile(fs, name);
-  try
-    Reset(fs, 1);
-  except
-    on E: Exception do
-    begin
-      WriteLn(ErrOutput, 'cannot open ', name);
-      Halt(1);
-    end;
-  end;
-  content := '';
-  repeat
-    BlockRead(fs, buf, SizeOf(buf), n);
-    if n > 0 then
-    begin
-      SetLength(content, Length(content) + n);
-      Move(buf, content[Length(content) - n + 1], n);
-    end;
-  until n <= 0;
-  CloseFile(fs);
-  try
-    f := LuaCompile(MainL, content, '@' + name);
-  except
-    on E: ELuaError do
-    begin
-      WriteLn(ErrOutput, E.Message);
-      Halt(1);
-    end;
-  end;
-  uv := TUpval.Create;
-  uv.V := LuaTab(MainL.GlobalT);
-  f.Upvals[0] := uv;
-  argt := TableGetStr(MainL.GlobalT, MainL.NewString('arg'));
-  if argt.Vt = vtTab then
+  v := LuaArg(L, 1);
+  if v.Vt = vtStr then
+    msg := v.S.Str
+  else if v.Vt in [vtInt, vtFlt] then
+    msg := RawByteString(NumToStr(v))
+  else
   begin
-    f.VarArgTable := argt.T;
-    f.VarArgPreset := True;
-  end;
-  MainL.PushValue(LuaFunc(f));
-  for i := 0 to Length(args) - 1 do
-    MainL.PushValue(StrToLua(args[i]));
-  try
-    LuaCall(MainL, Length(args), 0);
-  except
-    on E: ELuaError do
+    tm := GetMetaField(L, v, '__tostring');
+    if tm.Vt <> vtNil then
     begin
-      WriteLn(ErrOutput, E.Message);
-      Halt(1);
-    end;
-  end;
-end;
-
-procedure RunStdin;
-var
-  src, line: string;
-  f: TFunction;
-  uv: TUpval;
-  argt: TLuaValue;
-  pv: TLuaValue;
-  nres, i: Integer;
-begin
-  src := '';
-  if not interactive then
-  begin
-    while not Eof do
-    begin
-      ReadLn(line);
-      src := src + line + #10;
-    end;
-    RunChunk(src, '=stdin');
-    Exit;
-  end;
-  // simple REPL: evaluate each line and print results via global 'print'
-  while not Eof do
-  begin
-    ReadLn(line);
-    if line = '' then continue;
-    f := nil;
-    try
-      f := LuaCompile(MainL, RawByteString('return ' + line), '=stdin');
-    except
-      f := nil;
-    end;
-    if f = nil then
-    begin
-      try
-        f := LuaCompile(MainL, RawByteString(line), '=stdin');
-      except
-        on E: ELuaError do
-        begin
-          WriteLn(ErrOutput, E.Message);
-          continue;
-        end;
-      end;
-    end;
-    uv := TUpval.Create;
-    uv.V := LuaTab(MainL.GlobalT);
-    f.Upvals[0] := uv;
-    argt := TableGetStr(MainL.GlobalT, MainL.NewString('arg'));
-    if argt.Vt = vtTab then
-    begin
-      f.VarArgTable := argt.T;
-      f.VarArgPreset := True;
-    end;
-    MainL.PushValue(LuaFunc(f));
-    try
-      LuaCall(MainL, 0, -1);
-    except
-      on E: ELuaError do
+      tm := CallMeta(L, tm, [v]);
+      if tm.Vt = vtStr then
       begin
-        WriteLn(ErrOutput, E.Message);
-        continue;
+        LuaPush(L, tm);
+        Exit(1);
       end;
     end;
-    nres := MainL.Top - MainL.CI[MainL.NCI - 1].Base;
-    pv := TableGetStr(MainL.GlobalT, MainL.NewString('print'));
-    if (nres > 0) and (pv.Vt = vtFunc) then
-    begin
-      MainL.PushValue(pv);
-      for i := 0 to nres - 1 do
-        MainL.PushValue(MainL.Stack[MainL.CI[MainL.NCI - 1].Base + i]);
-      try
-        LuaCall(MainL, nres, 0);
-      except
-        on E: ELuaError do
-        begin
-          WriteLn(ErrOutput, E.Message);
-        end;
-      end;
-    end
-    else if (nres > 0) and (pv.Vt <> vtFunc) then
-    begin
-      WriteLn(ErrOutput, 'error calling ''print''');
-    end;
+    msg := RawByteString(Format('(error object is a %s value)', [VTypeName(v)]));
   end;
+  PushStr(L, Traceback(L, L, msg, True, 1));
+  Result := 1;
 end;
 
-procedure CreateArgTable(args: array of string; scriptIdx: Integer);
+const
+  SIGINT = 2;
+
+// SIGINT handler: the next signal kills the program; this one makes the running
+// thread raise an error at its next VM safe point
+procedure OnSigInt(sig: Integer); cdecl;
+begin
+  c_signal(SIGINT, nil);   // SIG_DFL
+  if GlobalL <> nil then
+    GlobalL.CurThread.HookMask := GlobalL.CurThread.HookMask or HOOK_INT;
+end;
+
+// calls the function below 'narg' arguments in protected mode
+function DoCallChunk(L: TLua; narg, nres: Integer): Integer;
+var
+  base: Integer;
+begin
+  base := L.Top - narg - 1;
+  LuaPush(L, LuaNil);
+  Move(L.Stack[base], L.Stack[base + 1], (narg + 1) * SizeOf(TLuaValue));
+  L.Stack[base] := LuaFunc(LightC(L, @MsgHandler, 'msghandler'));
+  c_signal(SIGINT, @OnSigInt);
+  Result := LuaProtectedCall(L, narg, nres, base);
+  c_signal(SIGINT, nil);
+  // remove the handler
+  Move(L.Stack[base + 1], L.Stack[base], (L.Top - base - 1) * SizeOf(TLuaValue));
+  Dec(L.Top);
+end;
+
+function LoadAndCall(L: TLua; const src: RawByteString; const name, mode: string): Integer;
+var
+  f: TFunction;
+  err: string;
+begin
+  if not LoadBuffer(L, src, name, mode, f, err) then
+  begin
+    PushStr(L, RawByteString(err));
+    Exit(1);
+  end;
+  SetEnvUpvalue(L, f, LuaTab(L.GlobalT));
+  LuaPush(L, LuaFunc(f));
+  Result := DoCallChunk(L, 0, 0);
+end;
+
+function DoString(L: TLua; const s, name: string): Integer;
+begin
+  Result := Report(L, LoadAndCall(L, RawByteString(s), name, 't'));
+end;
+
+function DoFile(L: TLua; const fname: string): Integer;
+var
+  content: RawByteString;
+  f: TFunction;
+  err: string;
+begin
+  if not ReadFileContent(fname, content) then
+  begin
+    PushStr(L, RawByteString('cannot open ' + fname));
+    Exit(Report(L, 1));
+  end;
+  PrepareFileChunk(content);
+  if not LoadBuffer(L, content, '@' + fname, 'bt', f, err) then
+  begin
+    PushStr(L, RawByteString(err));
+    Exit(Report(L, 1));
+  end;
+  SetEnvUpvalue(L, f, LuaTab(L.GlobalT));
+  LuaPush(L, LuaFunc(f));
+  Result := Report(L, DoCallChunk(L, 0, 0));
+end;
+
+function ReadStdin: RawByteString;
+var
+  buf: array[0..4095] of Char;
+begin
+  Result := '';
+  while c_fgets(@buf[0], SizeOf(buf), c_stdin) <> nil do
+    Result := Result + RawByteString(StrPas(PChar(@buf[0])));
+end;
+
+function DoStdin(L: TLua): Integer;
+var
+  s: RawByteString;
+begin
+  s := ReadStdin;
+  PrepareFileChunk(s);
+  Result := Report(L, LoadAndCall(L, s, '=stdin', 'bt'));
+end;
+
+function DoLibrary(L: TLua; const spec: string): Integer;
+var
+  globname, modname: string;
+  k, status: Integer;
+begin
+  k := Pos('=', spec);
+  if k = 0 then
+  begin
+    modname := spec;
+    globname := spec;
+    k := Pos('-', globname);
+    if k > 0 then globname := Copy(globname, 1, k - 1);
+  end
+  else
+  begin
+    globname := Copy(spec, 1, k - 1);
+    modname := Copy(spec, k + 1, MaxInt);
+  end;
+  LuaPush(L, TableGetStr(L.GlobalT, StrKey(L, 'require')));
+  PushStr(L, RawByteString(modname));
+  status := DoCallChunk(L, 1, 1);
+  if status = 0 then
+  begin
+    TableSetStr(L.GlobalT, StrKey(L, globname), L.Stack[L.Top - 1]);
+    Dec(L.Top);
+  end;
+  Result := Report(L, status);
+end;
+
+procedure CreateArgTable(L: TLua; script: Integer);
 var
   t: TTable;
   i: Integer;
-  n: Integer;
 begin
-  n := Length(args);
-  t := MainL.NewTable(0, 8);
-  // negative indices: interpreter args
-  for i := 0 to scriptIdx - 1 do
-    TableSetInt(t, i - scriptIdx, StrToLua(args[i]));
-  // 0: script name
-  if scriptIdx < n then
-    TableSetInt(t, 0, StrToLua(args[scriptIdx]))
-  else
-    TableSetInt(t, 0, StrToLua(ProgName));
-  // positive: script args
-  for i := scriptIdx + 1 to n - 1 do
-    TableSetInt(t, i - scriptIdx, StrToLua(args[i]));
-  TableSetStr(MainL.GlobalT, MainL.NewString('arg'), LuaTab(t));
+  t := L.NewTable(Length(Args) - (script + 1), script + 1);
+  for i := 0 to High(Args) do
+    TableSetInt(t, i - script, NewStr(L, RawByteString(Args[i])));
+  SetField(L, L.GlobalT, 'arg', LuaTab(t));
 end;
 
-procedure DoRequire(const spec: string);
+{ ------------------------------------------------------------------ }
+{ REPL                                                                }
+{ ------------------------------------------------------------------ }
+
+function GetPrompt(L: TLua; firstline: Boolean): string;
 var
-  modname, glob: string;
-  p: Integer;
-  req: TLuaValue;
+  v: TLuaValue;
 begin
-  p := Pos('=', spec);
-  if p > 0 then
+  if firstline then v := TableGetStr(L.GlobalT, StrKey(L, '_PROMPT'))
+  else v := TableGetStr(L.GlobalT, StrKey(L, '_PROMPT2'));
+  if v.Vt = vtNil then
   begin
-    glob := Copy(spec, 1, p - 1);
-    modname := Copy(spec, p + 1, Length(spec));
-  end
-  else
-  begin
-    glob := spec;
-    modname := spec;
+    if firstline then Exit('> ') else Exit('>> ');
   end;
-  // call require(modname)
-  req := TableGetStr(MainL.GlobalT, MainL.NewString('require'));
-  if req.Vt <> vtFunc then
+  Result := string(ToStringAux(L, v));
+end;
+
+function PushLine(L: TLua; firstline: Boolean): Boolean;
+var
+  buf: array[0..511] of Char;
+  s: string;
+  prompt: string;
+begin
+  prompt := GetPrompt(L, firstline);
+  Result := False;
+  OutWrite(RawByteString(prompt));
+  OutFlush;
+  if c_fgets(@buf[0], SizeOf(buf), c_stdin) = nil then Exit;
+  s := StrPas(PChar(@buf[0]));
+  if (Length(s) > 0) and (s[Length(s)] = #10) then Delete(s, Length(s), 1);
+  PushStr(L, RawByteString(s));
+  Result := True;
+end;
+
+// lines are read with plain stdio; only checks that the readline library can be loaded
+// (a warning is emitted when it cannot, as lua.c does)
+procedure InitReadline(L: TLua);
+var
+  rllib: string;
+  noenv: Boolean;
+begin
+  noenv := TableGetStr(L.Registry, StrKey(L, 'LUA_NOENV')).Vt <> vtNil;
+  rllib := '';
+  if not noenv then rllib := GetEnvironmentVariable('LUA_READLINELIB');
+  if rllib = '' then rllib := 'libreadline.so';
+  if c_dlopen(PChar(rllib), 2) = nil then   // RTLD_NOW
   begin
-    WriteLn(ErrOutput, 'require not available');
-    Exit;
+    WarnMessage(L, 'unable to load readline library ''', True);
+    WarnMessage(L, RawByteString(rllib), True);
+    WarnMessage(L, '''', False);
   end;
-  MainL.PushValue(req);
-  MainL.PushValue(StrToLua(modname));
-  try
-    LuaCall(MainL, 1, 1);
-    TableSetStr(MainL.GlobalT, MainL.NewString(glob), MainL.Stack[MainL.Top - 1]);
-    MainL.Top := MainL.Top - 1;
-  except
-    on E: ELuaError do
+end;
+
+// warns when a line starts a local declaration (locals do not survive across lines)
+procedure CheckLocal(const line: RawByteString);
+var
+  p: Integer;
+begin
+  p := 1;
+  while (p <= Length(line)) and (line[p] in [' ', #9]) do Inc(p);
+  if (Copy(line, p, 5) = 'local') and (p + 5 <= Length(line)) and (line[p + 5] in [' ', #9]) then
+    WriteErr('warning: locals do not survive across lines in interactive mode'#10);
+end;
+
+procedure DoREPL(L: TLua);
+var
+  line, full: RawByteString;
+  f: TFunction;
+  err: string;
+  status, i: Integer;
+  oldname: string;
+  incomplete, loaded: Boolean;
+  n, base: Integer;
+begin
+  oldname := ProgName;
+  ProgName := '';
+  InitReadline(L);
+  while True do
+  begin
+    LuaSetTop(L, 0);
+    if not PushLine(L, True) then Break;
+    line := L.Stack[L.Top - 1].S.Str;
+    Dec(L.Top);
+    // try as an expression first
+    loaded := LoadBuffer(L, 'return ' + line + ';', '=stdin', 't', f, err);
+    if not loaded then
     begin
-      WriteLn(ErrOutput, E.Message);
-      Halt(1);
+      CheckLocal(line);
+      full := line;
+      repeat
+        loaded := LoadBuffer(L, full, '=stdin', 't', f, err);
+        incomplete := (not loaded) and (Length(err) >= 5) and (Copy(err, Length(err) - 4, 5) = '<eof>');
+        if incomplete then
+        begin
+          if not PushLine(L, False) then Break;
+          full := full + #10 + L.Stack[L.Top - 1].S.Str;
+          Dec(L.Top);
+        end;
+      until not incomplete;
+    end;
+    if not loaded then
+    begin
+      PushStr(L, RawByteString(err));
+      Report(L, 1);
+      Continue;
+    end;
+    SetEnvUpvalue(L, f, LuaTab(L.GlobalT));
+    LuaPush(L, LuaFunc(f));
+    status := DoCallChunk(L, 0, -1);
+    if status = 0 then
+    begin
+      n := LuaGetTop(L);
+      if n > 0 then
+      begin
+        // print the results with the global 'print'
+        L.EnsureStack(L.Top + 25);
+        base := L.Top - n;
+        Move(L.Stack[base], L.Stack[base + 1], n * SizeOf(TLuaValue));
+        L.Stack[base] := TableGetStr(L.GlobalT, StrKey(L, 'print'));
+        Inc(L.Top);
+        status := LuaProtectedCall(L, n, 0, 0);
+        if status <> 0 then
+        begin
+          Message(ProgName, Format('error calling ''print'' (%s)',
+                  [string(ToStringAux(L, L.Stack[L.Top - 1]))]));
+        end;
+      end;
+    end
+    else
+      Report(L, status);
+  end;
+  LuaSetTop(L, 0);
+  OutWrite(#10);
+  OutFlush;
+  ProgName := oldname;
+end;
+
+{ ------------------------------------------------------------------ }
+
+function pmain(L: TLua): Integer;
+var
+  i, script, nargs, status, last: Integer;
+  hasI, hasV, hasE, noEnv, afterDash: Boolean;
+  opt, extra, init, initname: string;
+  f: TFunction;
+  err: string;
+  content: RawByteString;
+  chunkname: string;
+  argv: TLuaValue;
+begin
+  script := 0;
+  hasI := False;
+  hasV := False;
+  hasE := False;
+  noEnv := False;
+  afterDash := False;
+  last := High(Args);
+  i := 1;
+  while i <= last do
+  begin
+    script := i;
+    if (Args[i] = '') or (Args[i][1] <> '-') then Break;
+    opt := Args[i];
+    if Length(opt) = 1 then Break;     // '-': script is stdin
+    case opt[2] of
+      '-': begin
+        if Length(opt) > 2 then begin PrintUsage(opt); Exit(0); end;
+        if i + 1 <= last then script := i + 1 else script := 0;
+        afterDash := True;
+        i := last + 1;
+        Break;
+      end;
+      'E': begin
+        if Length(opt) > 2 then begin PrintUsage(opt); Exit(0); end;
+        noEnv := True;
+      end;
+      'W': if Length(opt) > 2 then begin PrintUsage(opt); Exit(0); end;
+      'i', 'v': begin
+        if Length(opt) > 2 then begin PrintUsage(opt); Exit(0); end;
+        if opt[2] = 'i' then hasI := True;
+        hasV := True;
+      end;
+      'e', 'l': begin
+        if opt[2] = 'e' then hasE := True;
+        if Length(opt) = 2 then
+        begin
+          Inc(i);
+          if (i > last) or ((Args[i] <> '') and (Args[i][1] = '-')) then
+          begin
+            PrintUsage(opt);
+            Exit(0);
+          end;
+        end;
+      end;
+    else
+      PrintUsage(opt);
+      Exit(0);
+    end;
+    Inc(i);
+    script := 0;
+  end;
+  if (i > last) and not afterDash then
+  begin
+    if script <> 0 then
+    begin
+      // no script name (all arguments were options)
+      if (Args[script] <> '') and (Args[script][1] = '-') and (Length(Args[script]) > 1) and
+         (Args[script][2] <> '-') then script := 0;
     end;
   end;
+  if hasV then
+  begin
+    OutWrite(LuaCopyright + #10);
+    OutFlush;
+  end;
+  if noEnv then
+    TableSetStr(L.Registry, StrKey(L, 'LUA_NOENV'), LuaBool(True));
+  OpenLibs(L);
+  CreateArgTable(L, script);
+  L.GCStopped := False;
+  L.Main.GCMode := 'generational';
+  // LUA_INIT
+  if not noEnv then
+  begin
+    initname := 'LUA_INIT_5_5';
+    init := GetEnvironmentVariable(initname);
+    if init = '' then
+    begin
+      initname := 'LUA_INIT';
+      init := GetEnvironmentVariable(initname);
+    end;
+    if init <> '' then
+    begin
+      if init[1] = '@' then status := DoFile(L, Copy(init, 2, MaxInt))
+      else status := DoString(L, init, '=' + initname);
+      if status <> 0 then Exit(0);
+    end;
+  end;
+  // -e, -l, -W
+  WarnMessage(L, '@off', False);
+  if script > 0 then nargs := script else nargs := Length(Args);
+  i := 1;
+  while i < nargs do
+  begin
+    opt := Args[i];
+    case opt[2] of
+      'e', 'l': begin
+        if Length(opt) > 2 then extra := Copy(opt, 3, MaxInt)
+        else begin Inc(i); extra := Args[i]; end;
+        if opt[2] = 'e' then status := DoString(L, extra, '=(command line)')
+        else status := DoLibrary(L, extra);
+        if status <> 0 then Exit(0);
+      end;
+      'W': WarnMessage(L, '@on', False);
+    end;
+    Inc(i);
+  end;
+  if script > 0 then
+  begin
+    if (Args[script] = '-') and not ((script > 1) and (Args[script - 1] = '--')) then
+    begin
+      // the script is the standard input
+      content := ReadStdin;
+      chunkname := '=stdin';
+    end
+    else
+    begin
+      if not ReadFileContent(Args[script], content) then
+      begin
+        PushStr(L, RawByteString(Format('cannot open %s', [Args[script]])));
+        Report(L, 1);
+        Exit(0);
+      end;
+      chunkname := '@' + Args[script];
+    end;
+    PrepareFileChunk(content);
+    if not LoadBuffer(L, content, chunkname, 'bt', f, err) then
+    begin
+      PushStr(L, RawByteString(err));
+      Report(L, 1);
+      Exit(0);
+    end;
+    SetEnvUpvalue(L, f, LuaTab(L.GlobalT));
+    LuaPush(L, LuaFunc(f));
+    // the arguments are the current contents of the 'arg' table
+    argv := TableGetStr(L.GlobalT, StrKey(L, 'arg'));
+    if argv.Vt <> vtTab then LuaError(L, '''arg'' is not a table');
+    nargs := Integer(TableLength(argv.T));
+    L.EnsureStack(L.Top + nargs + 25);
+    for i := 1 to nargs do LuaPush(L, TableGetInt(argv.T, i));
+    status := DoCallChunk(L, nargs, -1);
+    if Report(L, status) <> 0 then Exit(0);
+  end;
+  if hasI then
+    DoREPL(L)
+  else if (script < 1) and not (hasE or hasV) then
+  begin
+    if c_isatty(0) <> 0 then
+    begin
+      OutWrite(LuaCopyright + #10);
+      OutFlush;
+      DoREPL(L);
+    end
+    else
+      DoStdin(L);
+  end;
+  PushBool(L, True);
+  Result := 1;
+end;
+
+procedure CloseStateImpl(L: TLua);
+begin
+  LuaClose(L);
+end;
+
+function MainThread(p: Pointer): PtrInt;
+var
+  L: TLua;
+  status: Integer;
+begin
+  Result := 0;
+  SetExceptionMask([exInvalidOp, exDenormalized, exZeroDivide,
+                    exOverflow, exUnderflow, exPrecision]);
+  L := TLua.CreateMain;
+  GlobalL := L;
+  LuaInitVM(L);
+  L.GCStopped := True;      // while building the state
+  LuaPush(L, LuaFunc(LightC(L, @pmain, 'pmain')));
+  status := LuaProtectedCall(L, 0, 1, 0);
+  if status <> 0 then
+    Report(L, status);
+  if (status = 0) and Truthy(L.Stack[L.Top - 1]) then ExitStatus := 0 else ExitStatus := 1;
+  LuaClose(L);
+  OutFlush;
+  c_fflush(nil);
+  RTLEventSetEvent(Done);
 end;
 
 var
   i: Integer;
-  argc: Integer;
-  scriptIdx: Integer;
-  hasFiles: Boolean;
-  args: array of string;
-  arg0: string;
-  tmpArgs: array of string;
-  ignoreEnv: Boolean;
-  init: string;
-
-procedure RunLuaInit;
-var
-  s: string;
+  tid: TThreadID;
 begin
-  if ignoreEnv then Exit;
-  // emulate readline library load failure warning
-  s := GetEnvironmentVariable('LUA_READLINELIB');
-  if s <> '' then
-    WriteLn(ErrOutput, 'warning: unable to load readline library ''', s, '''');
-  s := GetEnvironmentVariable('LUA_INIT_5_5');
-  if s = '' then s := GetEnvironmentVariable('LUA_INIT');
-  if s = '' then Exit;
-  if (Length(s) > 1) and (s[1] = '@') then
-    RunFile(Copy(s, 2, Length(s) - 1), [])
-  else
-    RunChunk(s, '=LUA_INIT');
-end;
-
-begin
-  MainL := TLua.CreateMain;
-  LuaInitVM(MainL);
-  interactive := False;
-  scriptIdx := -1;
-  ignoreEnv := False;
-  // pre-scan for -E so libraries ignore environment
-  for i := 1 to ParamCount do
-    if ParamStr(i) = '-E' then ignoreEnv := True;
-  // pre-scan for the script index (first non-option argument)
-  preScriptIdx := -1;
-  i := 1;
-  while i <= ParamCount do
-  begin
-    sopt := ParamStr(i);
-    if (sopt = '-e') or (sopt = '-l') then
-    begin
-      Inc(i, 2);  // skip the option argument too
-      continue;
-    end;
-    if (sopt <> '') and (sopt[1] <> '-') then
-    begin
-      preScriptIdx := i;
-      Break;
-    end;
-    if sopt = '--' then
-    begin
-      if i < ParamCount then preScriptIdx := i + 1;
-      Break;
-    end;
-    if sopt = '-' then
-    begin
-      preScriptIdx := i;
-      Break;
-    end;
-    Inc(i);
-  end;
-  OpenLibsEx(MainL, not ignoreEnv);
-  argc := ParamCount;
-  SetLength(tmpArgs, argc + 1);
-  tmpArgs[0] := ParamStr(0);
-  for i := 1 to argc do
-    tmpArgs[i] := ParamStr(i);
-  ProgName := tmpArgs[0];
-  // create the arg table before running -e/-l modules
-  if preScriptIdx >= 1 then
-    CreateArgTable(tmpArgs, preScriptIdx)
-  else
-  begin
-    pt := MainL.NewTable(0, 4);
-    TableSetInt(pt, 0, StrToLua(ParamStr(0)));
-    TableSetStr(MainL.GlobalT, MainL.NewString('arg'), LuaTab(pt));
-  end;
-  i := 1;
-  while i <= argc do
-  begin
-    if tmpArgs[i] = '-' then
-    begin
-      // stdin
-      RunLuaInit;
-      RunStdin;
-      i := argc + 1;
-      scriptIdx := i;
-      Break;
-    end
-    else if tmpArgs[i] = '--' then
-    begin
-      Inc(i);
-      scriptIdx := i;
-      Break;
-    end
-    else if (tmpArgs[i] = '-v') and (Length(tmpArgs[i]) = 2) then
-    begin
-      PrintVersion;
-      if argc = 1 then Halt(0);
-    end
-    else if (tmpArgs[i] = '-i') and (Length(tmpArgs[i]) = 2) then
-      interactive := True
-    else if (tmpArgs[i] = '-W') and (Length(tmpArgs[i]) = 2) then
-    begin
-      // warnings flag: accepted (warning output always on for now)
-    end
-    else if (Length(tmpArgs[i]) > 2) and (tmpArgs[i][1] = '-') and (tmpArgs[i][2] = 'l') then
-    begin
-      DoRequire(Copy(tmpArgs[i], 3, Length(tmpArgs[i]) - 2));
-    end
-    else if (Length(tmpArgs[i]) >= 3) and (tmpArgs[i][1] = '-') and (tmpArgs[i][2] = 'e') and (tmpArgs[i][3] = ' ') then
-    begin
-      // "-e " with the chunk embedded (possibly empty)
-      RunChunk(Copy(tmpArgs[i], 4, Length(tmpArgs[i]) - 3), '=(command line)');
-      if HasError then Halt(1);
-    end
-    else if (tmpArgs[i] = '-e') and (Length(tmpArgs[i]) = 2) then
-    begin
-      Inc(i);
-      if i > argc then
-      begin
-        PrintUsage;
-        Halt(1);
-      end;
-      RunChunk(tmpArgs[i], '=(command line)');
-    end
-    else if (tmpArgs[i] = '-l') and (Length(tmpArgs[i]) = 2) then
-    begin
-      Inc(i);
-      if i > argc then
-      begin
-        PrintUsage;
-        Halt(1);
-      end;
-      DoRequire(tmpArgs[i]);
-    end
-    else if (tmpArgs[i] = '-E') and (Length(tmpArgs[i]) = 2) then
-    begin
-      ignoreEnv := True;
-    end
-    else if (tmpArgs[i] <> '') and (tmpArgs[i][1] = '-') then
-    begin
-      WriteLn(ErrOutput, 'unrecognized option ''', tmpArgs[i], '''');
-      PrintUsage;
-      Halt(1);
-    end
-    else
-    begin
-      scriptIdx := i;
-      Break;
-    end;
-    Inc(i);
-  end;
-  if (scriptIdx >= 1) and (scriptIdx <= argc) then
-  begin
-    RunLuaInit;
-    begin
-      SetLength(scriptArgs, argc - scriptIdx);
-      for i := 0 to argc - scriptIdx - 1 do
-        scriptArgs[i] := tmpArgs[scriptIdx + 1 + i];
-      RunFile(tmpArgs[scriptIdx], scriptArgs);
-    end;
-  end
-  else
-  begin
-    CreateArgTable(tmpArgs, argc + 1);
-    RunLuaInit;
-    if HasError then Halt(1);
-  if interactive or (libc_isatty(0) = 0) then
-      RunStdin;
-  end;
-  MainL.Free;
+  SetLength(Args, ParamCount + 1);
+  for i := 0 to ParamCount do Args[i] := ParamStr(i);
+  ProgName := Args[0];
+  CloseStateHook := @CloseStateImpl;
+  Done := RTLEventCreate;
+  BeginThread(@MainThread, nil, tid, MAIN_STACK_SIZE);
+  RTLEventWaitFor(Done);
+  c_fflush(nil);
+  Halt(ExitStatus);
 end.

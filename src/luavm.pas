@@ -1,1382 +1,2237 @@
 unit luavm;
 
 {$mode objfpc}{$H+}
+{$R-}{$Q-}
+{$POINTERMATH ON}
+{$GOTO ON}
+
+// The virtual machine: call frames, the instruction loop, metamethods,
+// error handling with variable names, upvalues, to-be-closed variables,
+// hooks and protected calls.
 
 interface
 
 uses
-  SysUtils, Math, luacore, luaparse;
+  SysUtils, Math, luacore, luaarith;
 
-procedure LuaInitVM(L: TLua);
-procedure LuaPush(L: TThread; const v: TLuaValue);
+type
+  // raised inside a coroutine to unwind its native stack when it is killed
+  ELuaKill = class(Exception);
+
+  TOperandKind = (okNone, okReg, okUpval);
+
+var
+  StackSlack: Integer = 0;         // extra stack allowed while handling errors
+  MainMaxCI: Integer = 190000;     // maximum call depth of the main thread
+  CoMaxCI: Integer = 12000;        // ... of a coroutine (smaller native stack)
+
+// ---- stack API (functions implemented in Pascal use these)
 function LuaGetTop(L: TThread): Integer;
 function LuaArg(L: TThread; i: Integer): TLuaValue;
 function LuaAbsIndex(L: TThread; i: Integer): Integer;
+procedure LuaPush(L: TThread; const v: TLuaValue);
 procedure LuaSetTop(L: TThread; n: Integer);
-procedure LuaError(L: TLua; const msg: string);
-procedure LuaErrorFmt(L: TLua; const msg: string; const args: array of const);
-procedure LuaRuntimeError(L: TLua; const msg: string);
 function LuaTypeName(L: TThread; i: Integer): string;
-procedure LuaCall(L: TThread; nargs, nresults: Integer);
-function LuaProtectedCall(L: TThread; nargs, nresults, errfunc: Integer): Integer;
-function LuaResume(L: TThread; co: TThread; nargs: Integer): Integer;
-procedure LuaYield(L: TThread; nresults: Integer);
-procedure CallFinalizer(L: TLua; f: TFunction; obj: TLuaValue);
-function GetMM(L: TLua; const v: TLuaValue; const name: string): TFunction;
+function ObjTypeName(L: TThread; const v: TLuaValue): string;   // honours __name
+
+// ---- errors
+function ErrorPosition(L: TThread; level: Integer): string;
+procedure LuaError(L: TLua; const msg: string);               // adds position (level 1)
+procedure LuaErrorFmt(L: TLua; const msg: string; const args: array of const);
+procedure LuaRuntimeError(L: TLua; const msg: string);        // adds position (level 0)
+procedure LuaThrow(L: TLua; const v: TLuaValue);              // raise a value as is
+procedure RunError(L: TThread; const msg: string);            // position of the running function
+function ErrorValueOf(L: TLua; E: ELuaError): TLuaValue;
+
+// ---- calls
+procedure DoCall(L: TLua; funcIdx, nargs, nresults: Integer);
+procedure LuaCall(L: TLua; nargs, nresults: Integer);        // not yieldable
+procedure LuaCallK(L: TLua; nargs, nresults: Integer);       // yieldable
+function LuaProtectedCall(L: TLua; nargs, nresults, errfunc: Integer): Integer;
+procedure CallFinalizer(L: TLua; const obj: TLuaValue);
+procedure LuaClose(L: TLua);                                  // runs all pending finalizers
+
+// ---- operations with metamethods (used by libraries)
+function GetMetatable(L: TThread; const v: TLuaValue): TTable;
+function GetTM(L: TThread; const v: TLuaValue; tm: Integer): TLuaValue;
+function GetMetaField(L: TThread; const v: TLuaValue; const name: string): TLuaValue;
+function LuaIndex(L: TLua; const t, key: TLuaValue): TLuaValue;
+procedure LuaSetIndex(L: TLua; const t, key, val: TLuaValue);
+function LuaEquals(L: TLua; const a, b: TLuaValue): Boolean;
+function LuaLessThan(L: TLua; const a, b: TLuaValue): Boolean;
+function LuaLessEqual(L: TLua; const a, b: TLuaValue): Boolean;
+function LuaLen(L: TLua; const v: TLuaValue): TLuaValue;
+function LuaArith(L: TLua; op: Integer; const a, b: TLuaValue): TLuaValue;
+function LuaConcat2(L: TLua; const a, b: TLuaValue): TLuaValue;
+function CallMeta(L: TLua; const f: TLuaValue; const args: array of TLuaValue): TLuaValue;
+function StrLess(const a, b: RawByteString): Boolean;
+
+// ---- upvalues and to-be-closed variables
+function FindUpval(L: TThread; idx: Integer): TUpval;
+procedure CloseUpvals(L: TThread; level: Integer);
+procedure CloseTbcUpTo(L: TLua; level: Integer);
+// closes upvalues and variables of a thread; with hasErr, 'err' is passed to the handlers
+procedure CloseThreadVars(L: TLua; level: Integer; var err: TLuaValue; hasErr: Boolean);
+
+// ---- debug information
+function ci_CurrentLine(const ci: TCallInfo): Integer;
+function ProtoLineAt(p: TProto; pc: Integer): Integer;
+function LocalNameAt(p: TProto; n: Integer; pc: Integer): string;   // n-th active local (1-based)
+function GetObjName(p: TProto; lastpc, reg: Integer; var name: string): string;
+function FuncNameFromCall(L: TThread; ciIdx: Integer; var name: string): string;
+function UpvalName(p: TProto; idx: Integer): string;
+procedure SetHookState(L: TThread; const func: TLuaValue; mask, count: Integer);
+
+procedure LuaInitVM(L: TLua);
 
 implementation
 
+var
+  PendingExtra: Integer = 0;   // extra arguments from a '__call' chain, handed to the next frame
+
 type
-  ELuaYield = class(Exception)
-  end;
+  PInstruction = ^TInstruction;
 
-// ---------------- error helpers ----------------
+const
+  MAXTAGLOOP = 2000;
+  LUA_MINSTACK = 20;
+  MAXCCALLS = 200;
 
-procedure LuaError(L: TLua; const msg: string);
+{ ===================================================================== }
+{ stack API                                                              }
+{ ===================================================================== }
+
+function CurBase(L: TThread): Integer; inline;
 begin
-  raise ELuaError.CreateMsg(msg);
+  if L.NCI = 0 then Result := 0 else Result := L.CI[L.NCI - 1].Base;
 end;
 
-procedure LuaErrorFmt(L: TLua; const msg: string; const args: array of const);
+function LuaGetTop(L: TThread): Integer;
 begin
-  raise ELuaError.CreateMsg(Format(msg, args));
+  Result := L.Top - CurBase(L);
 end;
 
-function SrcName(th: TThread): string;
+function LuaAbsIndex(L: TThread; i: Integer): Integer;
+begin
+  if i > 0 then Result := CurBase(L) + i - 1 else Result := L.Top + i;
+end;
+
+function LuaArg(L: TThread; i: Integer): TLuaValue;
 var
-  ci: TCallInfo;
-  p: TProto;
-  i: Integer;
+  idx: Integer;
 begin
-  for i := th.NCI - 1 downto 0 do
+  if i > 0 then
   begin
-    ci := th.CI[i];
-    if (not ci.IsC) and (ci.Func <> nil) and (ci.Func.Proto <> nil) then
+    idx := CurBase(L) + i - 1;
+    if idx >= L.Top then
     begin
-      p := ci.Func.Proto;
-      if p.Source <> nil then
-      begin
-        Result := p.Source.ToStr;
-        if (Length(Result) > 0) and (Result[1] = '=') then
-          Delete(Result, 1, 1);
-        Exit;
-      end;
+      Result.Vt := vtNil;
+      Exit;
     end;
-  end;
-  Result := '?';
-end;
-
-function CurLine(th: TThread): Integer;
-var
-  ci: TCallInfo;
-  p: TProto;
-  pc: Integer;
-  i: Integer;
-begin
-  for i := th.NCI - 1 downto 0 do
-  begin
-    ci := th.CI[i];
-    if (not ci.IsC) and (ci.Func <> nil) and (ci.Func.Proto <> nil) then
-    begin
-      p := ci.Func.Proto;
-      pc := ci.SavedPC - 1;
-      if (pc >= 0) and (pc < Length(p.LineInfo)) then
-        Exit(p.LineInfo[pc]);
-    end;
-  end;
-  Result := 0;
-end;
-
-function VarInfoSuffix(th: TThread; reg: Integer): string;
-var
-  ci: TCallInfo;
-  p: TProto;
-  pc, r: Integer;
-  ins: TInstruction;
-  kind, name: string;
-begin
-  Result := '';
-  if th.NCI <= 0 then Exit;
-  ci := th.CI[th.NCI - 1];
-  if ci.IsC or (ci.Func = nil) or (ci.Func.Proto = nil) then Exit;
-  p := ci.Func.Proto;
-  pc := ci.SavedPC;
-  r := reg;
-  while pc > 0 do
-  begin
-    ins := p.Code[pc - 1];
-    if (ins.Op = OP_MOVE) and (ins.A = r) then
-    begin
-      r := ins.B;
-      Dec(pc);
-      continue;
-    end;
-    if ((ins.Op = OP_GETFIELD) or (ins.Op = OP_GETTABUP)) and (ins.A = r) then
-    begin
-      if ins.Op = OP_GETTABUP then kind := 'global' else kind := 'field';
-      if (ins.C >= 0) and (ins.C < Length(p.K)) and (p.K[ins.C].Vt = vtStr) then
-        name := p.K[ins.C].S.ToStr
-      else
-        name := '?';
-      Exit(Format(' (%s ''%s'')', [kind, name]));
-    end;
-    Break;
-  end;
-end;
-
-procedure VMError(th: TThread; const msg: string);
-begin
-  raise ELuaError.CreateMsg(Format('%s:%d: %s', [SrcName(th), CurLine(th), msg]));
-end;
-
-procedure LuaRuntimeError(L: TLua; const msg: string);
-begin
-  VMError(L.CurThread, msg);
-end;
-
-procedure VMErrorVar(th: TThread; reg: Integer; const msg: string);
-begin
-  VMError(th, msg + VarInfoSuffix(th, reg));
-end;
-
-// ---------------- upvalues ----------------
-
-function FindOpenUpval(L: TThread; idx: Integer): TUpval;
-var
-  u: TUpval;
-begin
-  u := L.OpenUpvals;
-  while u <> nil do
-  begin
-    if (u.Open <> nil) and (u.StackIdx = idx) then
-      Exit(u);
-    u := u.Next;
-  end;
-  u := TUpval.Create;
-  u.Open := @L.Stack[idx];
-  u.StackIdx := idx;
-  u.Tbc := False;
-  u.Next := L.OpenUpvals;
-  L.OpenUpvals := u;
-  Result := u;
-end;
-
-procedure MarkTbc(L: TThread; idx: Integer);
-var
-  u: TUpval;
-begin
-  u := FindOpenUpval(L, idx);
-  u.Tbc := True;
-end;
-
-function GetCloseMM(const v: TLuaValue): TFunction;
-var
-  mt: TTable;
-  mm: TLuaValue;
-begin
-  case v.Vt of
-    vtTab: mt := v.T.Metatable;
-    vtUser: mt := v.U.Metatable;
+  end
   else
-    Exit(nil);
-  end;
-  if mt = nil then
-    Exit(nil);
-  mm := TableGetStr(mt, StaticStr('__close'));
-  if mm.Vt = vtFunc then
-    Result := mm.F
-  else
-    Result := nil;
+    idx := L.Top + i;
+  Result := L.Stack[idx];
 end;
 
-procedure CloseUpvals(L: TThread; idx: Integer);
-var
-  u, prev, next: TUpval;
-  mm: TFunction;
-  val: TLuaValue;
+procedure LuaPush(L: TThread; const v: TLuaValue);
 begin
-  prev := nil;
-  u := L.OpenUpvals;
-  while u <> nil do
-  begin
-    next := u.Next;
-    if (u.Open <> nil) and (u.StackIdx >= idx) then
-    begin
-      if u.Tbc and not IsNil(u.Open^) then
-      begin
-        val := u.Open^;
-        u.Open^ := LuaNil;
-        u.V := LuaNil;
-        u.Open := nil;
-        if prev = nil then L.OpenUpvals := next else prev.Next := next;
-        u.NextClosed := L.ClosedUpvals;
-        L.ClosedUpvals := u;
-        mm := GetCloseMM(val);
-        if mm <> nil then
-        begin
-          LuaPush(L, val);
-          LuaCall(L, 1, 0);
-        end;
-      end
-      else
-      begin
-        u.V := u.Open^;
-        u.Open := nil;
-        if prev = nil then L.OpenUpvals := next else prev.Next := next;
-        u.NextClosed := L.ClosedUpvals;
-        L.ClosedUpvals := u;
-      end;
-      u := next;
-      continue;
-    end;
-    prev := u;
-    u := next;
-  end;
+  if L.Top >= Length(L.Stack) then L.EnsureStack(L.Top + 1);
+  L.Stack[L.Top] := v;
+  Inc(L.Top);
 end;
 
-// ---------------- metatables ----------------
+procedure LuaSetTop(L: TThread; n: Integer);
+begin
+  L.SetTop(CurBase(L) + n);
+end;
 
-function GetMetatable(const v: TLuaValue): TTable;
+function MetatableOf(L: TThread; const v: TLuaValue): TTable; inline;
 begin
   case v.Vt of
     vtTab: Result := v.T.Metatable;
     vtUser: Result := v.U.Metatable;
   else
-    Result := nil;
+    Result := L.Main.TypeMeta[v.Vt];
   end;
 end;
 
-function GetMM(L: TLua; const v: TLuaValue; const name: string): TFunction;
-var
-  mt: TTable;
-  mm: TLuaValue;
+function GetMetatable(L: TThread; const v: TLuaValue): TTable;
 begin
-  mt := GetMetatable(v);
-  if (mt = nil) and (v.Vt = vtStr) and (L <> nil) then
-    mt := L.MetaStr;
-  if mt = nil then Exit(nil);
-  mm := TableGetStr(mt, StaticStr(name));
-  if mm.Vt = vtFunc then Result := mm.F else Result := nil;
+  Result := MetatableOf(L, v);
 end;
 
-// ---------------- call helpers ----------------
+function GetTM(L: TThread; const v: TLuaValue; tm: Integer): TLuaValue;
+var
+  mt: TTable;
+begin
+  mt := MetatableOf(L, v);
+  if mt = nil then
+    Result.Vt := vtNil
+  else
+    Result := TableGetStr(mt, TMName(tm));
+end;
 
-procedure PushCI(L: TThread; f: TFunction; base: Integer; isC: Boolean);
+function GetMetaField(L: TThread; const v: TLuaValue; const name: string): TLuaValue;
+var
+  mt: TTable;
+begin
+  mt := MetatableOf(L, v);
+  if mt = nil then
+    Result.Vt := vtNil
+  else
+    Result := TableGetStr(mt, L.Main.NewString(RawByteString(name)));
+end;
+
+function ObjTypeName(L: TThread; const v: TLuaValue): string;
+var
+  mt: TTable;
+  n: TLuaValue;
+begin
+  if v.Vt in [vtTab, vtUser] then
+  begin
+    mt := MetatableOf(L, v);
+    if mt <> nil then
+    begin
+      n := TableGetStr(mt, L.Main.NewString('__name'));
+      if n.Vt = vtStr then Exit(string(n.S.Str));
+    end;
+  end;
+  Result := VTypeName(v);
+end;
+
+function LuaTypeName(L: TThread; i: Integer): string;
+begin
+  Result := ObjTypeName(L, LuaArg(L, i));
+end;
+
+{ ===================================================================== }
+{ debug information                                                      }
+{ ===================================================================== }
+
+function ProtoLineAt(p: TProto; pc: Integer): Integer;
+begin
+  if (pc >= 0) and (pc < Length(p.LineInfo)) then Result := p.LineInfo[pc] else Result := -1;
+end;
+
+function ci_CurrentLine(const ci: TCallInfo): Integer;
+begin
+  if ci.IsC or (ci.Func = nil) then Exit(-1);
+  Result := ProtoLineAt(ci.Func.Proto, ci.SavedPC - 1);
+end;
+
+function LocalNameAt(p: TProto; n: Integer; pc: Integer): string;
+var
+  i: Integer;
+begin
+  Result := '';
+  for i := 0 to Length(p.LocVars) - 1 do
+  begin
+    if p.LocVars[i].StartPC > pc then Break;
+    if pc < p.LocVars[i].EndPC then
+    begin
+      Dec(n);
+      if n = 0 then
+      begin
+        if p.LocVars[i].Name <> nil then Result := string(p.LocVars[i].Name.Str);
+        Exit;
+      end;
+    end;
+  end;
+end;
+
+function UpvalName(p: TProto; idx: Integer): string;
+begin
+  if (idx >= 0) and (idx < Length(p.UpvalDescs)) and (p.UpvalDescs[idx].Name <> nil) then
+    Result := string(p.UpvalDescs[idx].Name.Str)
+  else
+    Result := '?';
+end;
+
+// does the instruction write register 'reg'?
+function InstrSetsReg(const ins: TInstruction; reg: Integer): Boolean;
+begin
+  case ins.Op of
+    OP_LOADNIL: Result := (ins.A <= reg) and (reg <= ins.A + ins.B);
+    OP_TFORCALL: Result := reg >= ins.A + 3;
+    OP_CALL, OP_TAILCALL: Result := reg >= ins.A;
+    OP_SELF: Result := (reg = ins.A) or (reg = ins.A + 1);
+    OP_VARARG: Result := reg >= ins.A;
+    OP_FORPREP, OP_FORLOOP: Result := (reg >= ins.A) and (reg <= ins.A + 2);
+    OP_TFORPREP: Result := (reg >= ins.A + 2) and (reg <= ins.A + 3);
+    OP_SETUPVAL, OP_SETTABUP, OP_SETTABLE, OP_SETLIST, OP_CLOSE, OP_TBC,
+    OP_JMP, OP_JT, OP_JF, OP_EQ, OP_LT, OP_LE, OP_RETURN, OP_ERRNNIL,
+    OP_NOP, OP_TFORLOOP: Result := False;
+  else
+    Result := reg = ins.A;
+  end;
+end;
+
+function FindSetReg(p: TProto; lastpc, reg: Integer): Integer;
+var
+  pc, setreg, jmptarget, dest: Integer;
+  ins: TInstruction;
+begin
+  setreg := -1;
+  jmptarget := 0;
+  for pc := 0 to lastpc - 1 do
+  begin
+    ins := p.Code[pc];
+    case ins.Op of
+      OP_JMP: begin
+        dest := ins.A;
+        if (dest > pc) and (dest <= lastpc) and (dest > jmptarget) then jmptarget := dest;
+      end;
+      OP_JT, OP_JF: begin
+        dest := ins.B;
+        if (dest > pc) and (dest <= lastpc) and (dest > jmptarget) then jmptarget := dest;
+      end;
+    end;
+    if InstrSetsReg(ins, reg) then
+    begin
+      if pc < jmptarget then setreg := -1 else setreg := pc;
+    end;
+  end;
+  Result := setreg;
+end;
+
+function KName(p: TProto; x: Integer; var name: string): string;
+begin
+  // x is an RK operand: constants are negative
+  if (x < 0) and (-1 - x < Length(p.K)) and (p.K[-1 - x].Vt = vtStr) then
+  begin
+    name := string(p.K[-1 - x].S.Str);
+    Result := 'constant';
+  end
+  else
+  begin
+    name := '?';
+    Result := '';
+  end;
+end;
+
+function BasicGetObjName(p: TProto; var pc: Integer; reg: Integer; var name: string): string;
+var
+  ins: TInstruction;
+begin
+  name := LocalNameAt(p, reg + 1, pc);
+  if name <> '' then Exit('local');
+  pc := FindSetReg(p, pc, reg);
+  Result := '';
+  if pc >= 0 then
+  begin
+    ins := p.Code[pc];
+    case ins.Op of
+      OP_MOVE:
+        if ins.B < ins.A then
+          Exit(BasicGetObjName(p, pc, ins.B, name));
+      OP_GETUPVAL: begin
+        name := UpvalName(p, ins.B);
+        Exit('upvalue');
+      end;
+      OP_LOADK:
+        if (ins.B < Length(p.K)) and (p.K[ins.B].Vt = vtStr) then
+        begin
+          name := string(p.K[ins.B].S.Str);
+          Exit('constant');
+        end;
+    end;
+  end;
+  name := '';
+end;
+
+function RegName(p: TProto; pc, reg: Integer; var name: string): string;
+var
+  what: string;
+begin
+  what := BasicGetObjName(p, pc, reg, name);
+  if what <> 'constant' then name := '?';
+  Result := what;
+end;
+
+function IsEnvTable(p: TProto; pc: Integer; const ins: TInstruction; isUp: Boolean): string;
+var
+  name, what: string;
+begin
+  name := '';
+  if isUp then
+    name := UpvalName(p, ins.B)
+  else
+  begin
+    what := BasicGetObjName(p, pc, ins.B, name);
+    if (what <> 'local') and (what <> 'upvalue') then name := '';
+  end;
+  if name = '_ENV' then Result := 'global' else Result := 'field';
+end;
+
+function GetObjName(p: TProto; lastpc, reg: Integer; var name: string): string;
+var
+  pc: Integer;
+  ins: TInstruction;
+begin
+  pc := lastpc;
+  Result := BasicGetObjName(p, pc, reg, name);
+  if Result <> '' then Exit;
+  if pc < 0 then Exit;
+  ins := p.Code[pc];
+  case ins.Op of
+    OP_GETTABUP: begin
+      KName(p, ins.C, name);
+      Result := IsEnvTable(p, pc, ins, True);
+    end;
+    OP_GETTABLE: begin
+      if ins.C < 0 then KName(p, ins.C, name) else RegName(p, pc, ins.C, name);
+      Result := IsEnvTable(p, pc, ins, False);
+    end;
+    OP_SELF: begin
+      if ins.C < 0 then KName(p, ins.C, name) else RegName(p, pc, ins.C, name);
+      Result := 'method';
+    end;
+    OP_GETVARG: begin
+      if ins.C < 0 then KName(p, ins.C, name) else RegName(p, pc, ins.C, name);
+      Result := 'field';
+    end;
+  end;
+end;
+
+function FuncNameFromCode(p: TProto; pc: Integer; var name: string): string;
+var
+  ins: TInstruction;
+  tm: Integer;
+begin
+  Result := '';
+  if (pc < 0) or (pc >= Length(p.Code)) then Exit;
+  ins := p.Code[pc];
+  tm := -1;
+  case ins.Op of
+    OP_CALL, OP_TAILCALL: Exit(GetObjName(p, pc, ins.A, name));
+    OP_TFORCALL: begin
+      name := 'for iterator';
+      Exit('for iterator');
+    end;
+    OP_SELF, OP_GETTABUP, OP_GETTABLE: tm := TM_INDEX;
+    OP_SETTABUP, OP_SETTABLE: tm := TM_NEWINDEX;
+    OP_ADD: tm := TM_ADD;
+    OP_SUB: tm := TM_SUB;
+    OP_MUL: tm := TM_MUL;
+    OP_MOD: tm := TM_MOD;
+    OP_POW: tm := TM_POW;
+    OP_DIV: tm := TM_DIV;
+    OP_IDIV: tm := TM_IDIV;
+    OP_BAND: tm := TM_BAND;
+    OP_BOR: tm := TM_BOR;
+    OP_BXOR: tm := TM_BXOR;
+    OP_SHL: tm := TM_SHL;
+    OP_SHR: tm := TM_SHR;
+    OP_UNM: tm := TM_UNM;
+    OP_BNOT: tm := TM_BNOT;
+    OP_LEN: tm := TM_LEN;
+    OP_CONCAT: tm := TM_CONCAT;
+    OP_EQ: tm := TM_EQ;
+    OP_LT: tm := TM_LT;
+    OP_LE: tm := TM_LE;
+    OP_CLOSE, OP_RETURN: tm := TM_CLOSE;
+  else
+    Exit;
+  end;
+  name := Copy(MT_NAMES[tm], 3, 100);
+  Result := 'metamethod';
+end;
+
+function FuncNameFromCall(L: TThread; ciIdx: Integer; var name: string): string;
+var
+  caller: TCallInfo;
+begin
+  Result := '';
+  if (ciIdx <= 0) or (ciIdx >= L.NCI) then Exit;
+  if L.CI[ciIdx].IsTail then Exit;
+  caller := L.CI[ciIdx - 1];
+  if caller.Hooked then
+  begin
+    name := '?';
+    Exit('hook');
+  end;
+  if caller.InFinalizer then
+  begin
+    name := '__gc';
+    Exit('metamethod');
+  end;
+  if caller.IsC or (caller.Func = nil) then Exit;
+  Result := FuncNameFromCode(caller.Func.Proto, caller.SavedPC - 1, name);
+end;
+
+{ ===================================================================== }
+{ errors                                                                 }
+{ ===================================================================== }
+
+function ErrorPosition(L: TThread; level: Integer): string;
+var
+  idx: Integer;
+  ci: TCallInfo;
+  p: TProto;
+begin
+  Result := '';
+  idx := L.NCI - 1 - level;
+  if (idx < 0) or (idx >= L.NCI) then Exit;
+  ci := L.CI[idx];
+  if ci.IsC or (ci.Func = nil) then Exit;
+  p := ci.Func.Proto;
+  if p.Source = nil then
+    Result := '?:?: '
+  else
+    Result := Format('%s:%d: ', [ChunkIdStr(string(p.Source.Str)), ProtoLineAt(p, ci.SavedPC - 1)]);
+end;
+
+procedure LuaError(L: TLua; const msg: string);
+begin
+  raise ELuaError.CreateMsg(ErrorPosition(L, 1) + msg);
+end;
+
+procedure LuaErrorFmt(L: TLua; const msg: string; const args: array of const);
+begin
+  LuaError(L, Format(msg, args));
+end;
+
+procedure RunError(L: TThread; const msg: string);
+begin
+  raise ELuaError.CreateMsg(ErrorPosition(L, 0) + msg);
+end;
+
+procedure LuaRuntimeError(L: TLua; const msg: string);
+begin
+  RunError(L, msg);
+end;
+
+procedure LuaThrow(L: TLua; const v: TLuaValue);
+begin
+  raise ELuaError.CreateValue(v);
+end;
+
+function ErrorValueOf(L: TLua; E: ELuaError): TLuaValue;
+begin
+  if E.HasValue then
+    Result := E.ErrValue
+  else
+    Result := LuaStr(L.NewString(RawByteString(E.Message)));
+end;
+
+function VarInfoOf(L: TThread; kind: TOperandKind; idx: Integer): string;
 var
   ci: TCallInfo;
+  p: TProto;
+  k, name: string;
+begin
+  Result := '';
+  if (L.NCI = 0) or (kind = okNone) then Exit;
+  ci := L.CI[L.NCI - 1];
+  if ci.IsC or (ci.Func = nil) then Exit;
+  p := ci.Func.Proto;
+  name := '';
+  if kind = okUpval then
+  begin
+    name := UpvalName(p, idx);
+    k := 'upvalue';
+  end
+  else
+    k := GetObjName(p, ci.SavedPC - 1, idx, name);
+  if k <> '' then Result := Format(' (%s ''%s'')', [k, name]);
+end;
+
+procedure TypeError(L: TThread; const v: TLuaValue; const op: string;
+                    kind: TOperandKind; idx: Integer);
+begin
+  RunError(L, Format('attempt to %s a %s value%s',
+                     [op, ObjTypeName(L, v), VarInfoOf(L, kind, idx)]));
+end;
+
+procedure CallError(L: TThread; const v: TLuaValue);
+var
+  ci: TCallInfo;
+  name, kind, extra: string;
+begin
+  extra := '';
+  if L.NCI > 0 then
+  begin
+    ci := L.CI[L.NCI - 1];
+    if (not ci.IsC) and (ci.Func <> nil) then
+    begin
+      name := '';
+      kind := FuncNameFromCode(ci.Func.Proto, ci.SavedPC - 1, name);
+      if kind <> '' then
+        extra := Format(' (%s ''%s'')', [kind, name]);
+    end;
+  end;
+  RunError(L, Format('attempt to call a %s value%s', [ObjTypeName(L, v), extra]));
+end;
+
+{ ===================================================================== }
+{ upvalues, to-be-closed variables                                       }
+{ ===================================================================== }
+
+function FindUpval(L: TThread; idx: Integer): TUpval;
+var
+  p, prev: TUpval;
+begin
+  prev := nil;
+  p := L.OpenUpvals;
+  while (p <> nil) and (p.Idx >= idx) do
+  begin
+    if p.Idx = idx then Exit(p);
+    prev := p;
+    p := p.NextOpen;
+  end;
+  Result := L.Main.NewUpval;
+  Result.Th := L;
+  Result.Idx := idx;
+  Result.NextOpen := p;
+  if prev = nil then L.OpenUpvals := Result else prev.NextOpen := Result;
+end;
+
+procedure CloseUpvals(L: TThread; level: Integer);
+var
+  u: TUpval;
+begin
+  while (L.OpenUpvals <> nil) and (L.OpenUpvals.Idx >= level) do
+  begin
+    u := L.OpenUpvals;
+    L.OpenUpvals := u.NextOpen;
+    u.V := L.Stack[u.Idx];
+    u.Idx := -1;
+    u.Th := nil;
+    u.NextOpen := nil;
+  end;
+end;
+
+procedure RegisterTbc(L: TLua; idx: Integer);
+var
+  v: TLuaValue;
+  name: string;
+  ci: TCallInfo;
+begin
+  v := L.Stack[idx];
+  if IsFalse(v) then Exit;   // nil and false need no closing
+  if GetTM(L, v, TM_CLOSE).Vt = vtNil then
+  begin
+    name := '?';
+    ci := L.CI[L.NCI - 1];
+    if (not ci.IsC) and (ci.Func <> nil) then
+    begin
+      name := LocalNameAt(ci.Func.Proto, idx - ci.Base + 1, ci.SavedPC - 1);
+      if name = '' then name := '?';
+    end;
+    RunError(L, Format('variable ''%s'' got a non-closable value', [name]));
+  end;
+  if L.NTbc >= Length(L.TbcList) then SetLength(L.TbcList, L.NTbc * 2 + 8);
+  L.TbcList[L.NTbc] := idx;
+  Inc(L.NTbc);
+end;
+
+// calls the __close metamethod of the value at stack index idx
+procedure CallClose(L: TLua; idx: Integer; const err: TLuaValue; hasErr: Boolean);
+var
+  v, tm: TLuaValue;
+  fi: Integer;
+begin
+  v := L.Stack[idx];
+  tm := GetTM(L, v, TM_CLOSE);
+  fi := L.Top;
+  L.EnsureStack(fi + 5);
+  L.Stack[fi] := tm;
+  L.Stack[fi + 1] := v;
+  if hasErr then
+  begin
+    L.Stack[fi + 2] := err;
+    L.Top := fi + 3;
+  end
+  else
+    L.Top := fi + 2;   // no error: the method receives no second argument
+  if tm.Vt = vtNil then
+    RunError(L, 'metamethod ''close'' is not callable');
+  LuaCallK(L, Ord(hasErr) + 1, 0);
+end;
+
+// closes (normally) all to-be-closed variables at or above 'level'
+procedure CloseTbcUpTo(L: TLua; level: Integer);
+var
+  idx: Integer;
+  nilv: TLuaValue;
+begin
+  nilv.Vt := vtNil;
+  while (L.NTbc > 0) and (L.TbcList[L.NTbc - 1] >= level) do
+  begin
+    idx := L.TbcList[L.NTbc - 1];
+    Dec(L.NTbc);
+    CallClose(L, idx, nilv, False);
+  end;
+end;
+
+// closes upvalues and variables of a function that is finishing or being
+// unwound because of an error; an error in a closing method replaces 'err'
+procedure CloseThreadVars(L: TLua; level: Integer; var err: TLuaValue; hasErr: Boolean);
+var
+  idx, savedTop, savedNCI, savedCc, savedNNY: Integer;
+  savedHook: Boolean;
+begin
+  CloseUpvals(L, level);
+  savedTop := L.Top;
+  savedNCI := L.NCI;
+  savedCc := L.NCcalls;
+  savedNNY := L.NNY;
+  savedHook := L.InHook;
+  L.EnsureStack(savedTop + 2);
+  L.Stack[savedTop] := err;   // keeps the pending error visible to the GC
+  while (L.NTbc > 0) and (L.TbcList[L.NTbc - 1] >= level) do
+  begin
+    idx := L.TbcList[L.NTbc - 1];
+    Dec(L.NTbc);
+    try
+      L.Top := savedTop + 1;
+      CallClose(L, idx, err, hasErr);
+    except
+      on E: ELuaError do
+      begin
+        err := ErrorValueOf(L, E);
+        L.NCI := savedNCI;
+        L.NCcalls := savedCc;
+        L.NNY := savedNNY;
+        L.InHook := savedHook;
+        L.Stack[savedTop] := err;
+        hasErr := True;
+      end;
+    end;
+  end;
+  L.Top := savedTop;
+end;
+
+{ ===================================================================== }
+{ calls                                                                  }
+{ ===================================================================== }
+
+procedure PushCI(L: TThread; f: TFunction; funcIdx, base, top, nresults: Integer; isC: Boolean);
+var
+  ci: ^TCallInfo;
 begin
   if L.NCI >= Length(L.CI) then
     SetLength(L.CI, Length(L.CI) * 2);
-  ci.Func := f;
-  ci.Base := base;
-  ci.Top := L.Top;
-  ci.SavedPC := 0;
-  ci.NResults := 0;
-  ci.CallStatus := 0;
-  ci.PrevCI := L.NCI - 1;
-  ci.IsC := isC;
-  L.CI[L.NCI] := ci;
+  ci := @L.CI[L.NCI];
+  ci^.Func := f;
+  ci^.FuncIdx := funcIdx;
+  ci^.Base := base;
+  ci^.Top := top;
+  ci^.SavedPC := 0;
+  ci^.NResults := nresults;
+  ci^.NExtra := 0;
+  ci^.IsC := isC;
+  ci^.IsTail := False;
+  ci^.Hooked := False;
+  ci^.InFinalizer := False;
+  ci^.FTransfer := 0;
+  ci^.NTransfer := 0;
+  ci^.ExtraArgs := PendingExtra;
+  PendingExtra := 0;
   Inc(L.NCI);
 end;
 
-procedure ClearTable(t: TTable);
+function ThreadMaxCI(L: TThread): Integer; inline;
+begin
+  if L.Runner = nil then Result := MainMaxCI else Result := CoMaxCI;
+end;
+
+procedure CallHook(L: TLua; const ev: string; line: Integer); forward;
+procedure CallHookTransfer(L: TLua; const ev: string; ftr, ntr: Integer); forward;
+
+// moves 'n' results starting at 'first' to 'res'
+procedure PostCall(L: TLua; res, first, n, wanted: Integer);
 var
   i: Integer;
 begin
-  for i := 0 to Length(t.Arr) - 1 do
-    t.Arr[i] := LuaNil;
-  for i := 0 to Length(t.Bucket) - 1 do
-    t.Bucket[i] := -1;
-  for i := 0 to Length(t.Node) - 1 do
+  if wanted < 0 then
   begin
-    t.Node[i].Key := LuaNil;
-    t.Node[i].Val := LuaNil;
-    t.Node[i].Next := i + 1;
-  end;
-  if Length(t.Node) > 0 then
+    if res <> first then
+      for i := 0 to n - 1 do L.Stack[res + i] := L.Stack[first + i];
+    L.Top := res + n;
+  end
+  else
   begin
-    t.Node[Length(t.Node) - 1].Next := -1;
-    t.LastFree := 0;
+    if n > wanted then n := wanted;
+    if res <> first then
+      for i := 0 to n - 1 do L.Stack[res + i] := L.Stack[first + i];
+    for i := n to wanted - 1 do L.Stack[res + i].Vt := vtNil;
+    L.Top := res + wanted;
   end;
 end;
 
-function CallMeta2(L: TThread; mm: TFunction; const a, b: TLuaValue): TLuaValue;
-begin
-  LuaPush(L, LuaFunc(mm));
-  LuaPush(L, a);
-  LuaPush(L, b);
-  LuaCall(L, 3, 1);
-  Result := L.Stack[L.Top - 1];
-end;
-
-function CallMeta1(L: TThread; mm: TFunction; const a: TLuaValue): TLuaValue;
-begin
-  LuaPush(L, LuaFunc(mm));
-  LuaPush(L, a);
-  LuaCall(L, 2, 1);
-  Result := L.Stack[L.Top - 1];
-end;
-
-procedure VMExecute(L: TThread); forward;
-
-// Call function f with nargs args at [Top-nargs..Top-1].
-// Results placed at resultBase (nresults = -1 for all).
-procedure DoCall(L: TThread; f: TFunction; nargs, nresults, resultBase, argsBase: Integer);
+procedure CallC(L: TLua; f: TFunction; funcIdx, nargs, nresults: Integer);
 var
-  base, i, nres, n: Integer;
-  vtab: TTable;
+  n: Integer;
+begin
+  L.EnsureStack(L.Top + LUA_MINSTACK + 5);
+  PushCI(L, f, funcIdx, funcIdx + 1, L.Top + LUA_MINSTACK, nresults, True);
+  if L.HookMask <> 0 then
+    if (L.HookMask and HOOK_CALL) <> 0 then CallHookTransfer(L, 'call', 1, nargs);
+  n := f.CProc(L);
+  if L.HookMask <> 0 then
+    if (L.HookMask and HOOK_RET) <> 0 then CallHookTransfer(L, 'return', L.Top - n - funcIdx, n);
+  PostCall(L, funcIdx, L.Top - n, n, nresults);
+  Dec(L.NCI);
+  // a Lua caller continues after its call instruction (for line events)
+  if (L.HookMask <> 0) and (L.NCI > 0) and not L.CI[L.NCI - 1].IsC then
+    L.OldLine := L.CI[L.NCI - 1].SavedPC - 1;
+end;
+
+// raised when the stack is exhausted; while a message handler is already running
+// on the reserve space, the error is a failure of the handler itself
+procedure StackOverflow(L: TLua);
+begin
+  if StackSlack > 0 then
+    raise ELuaError.CreateMsg('error in error handling')
+  else
+    RunError(L, 'stack overflow');
+end;
+
+// prepares the frame of a Lua function: returns the new base
+procedure SetupLuaFrame(L: TLua; f: TFunction; funcIdx, nargs: Integer;
+                        var base, nextra: Integer);
+var
   p: TProto;
+  nfix, i, need: Integer;
+  tbl: TTable;
 begin
-  if L.NCI >= 20000 then
-    VMError(L, 'stack overflow');
-  base := argsBase;
-  if f.IsC then
+  p := f.Proto;
+  nfix := p.NumParams;
+  need := funcIdx + 2 + nargs + nfix + p.MaxStackSize + LUA_MINSTACK;
+  if need > MAXSTACK + StackSlack then
+    StackOverflow(L);
+  L.EnsureStack(need);
+  for i := nargs to nfix - 1 do
+    L.Stack[funcIdx + 1 + i].Vt := vtNil;
+  if p.IsVararg then
   begin
-    PushCI(L, f, base, True);
-    L.Main.CurThread := L;
-    L.Top := base + nargs;
-    try
-      nres := f.CProc(L.Main);
-    except
-      on E: ELuaYield do
-      begin
-        Dec(L.NCI);
-        raise;
-      end;
-      on E: ELuaError do
-      begin
-        Dec(L.NCI);
-        raise;
-      end;
+    if nargs < nfix then nargs := nfix;
+    nextra := nargs - nfix;
+    base := funcIdx + 1 + nargs;
+    for i := 0 to nfix - 1 do
+    begin
+      L.Stack[base + i] := L.Stack[funcIdx + 1 + i];
+      L.Stack[funcIdx + 1 + i].Vt := vtNil;
     end;
-    Dec(L.NCI);
-    if nresults < 0 then
+    // registers above the parameters start as nil (no stale references)
+    for i := nfix to p.MaxStackSize - 1 do
+      L.Stack[base + i].Vt := vtNil;
+    if p.VarTabReg >= 0 then
     begin
-      n := nres;
-      for i := 0 to n - 1 do
-        L.Stack[resultBase + i] := L.Stack[base + i];
-      L.Top := resultBase + n;
-    end
-    else
-    begin
-      for i := 0 to nresults - 1 do
-      begin
-        if i < nres then
-          L.Stack[resultBase + i] := L.Stack[base + i]
-        else
-          L.Stack[resultBase + i] := LuaNil;
-      end;
-      L.Top := resultBase + nresults;
+      tbl := L.Main.NewTable(nextra, 1);
+      for i := 1 to nextra do
+        TableSetInt(tbl, i, L.Stack[funcIdx + nfix + i]);
+      TableSetStr(tbl, L.Main.NewString('n'), LuaInt(nextra));
+      L.Stack[base + p.VarTabReg] := LuaTab(tbl);
     end;
   end
   else
   begin
-    p := f.Proto;
-    L.EnsureStack(base + p.MaxStackSize + 10);
-    PushCI(L, f, base, False);
-    L.CI[L.NCI - 1].NResults := nresults;
-    for i := nargs to p.NumParams - 1 do
-      L.Stack[base + i] := LuaNil;
-    if p.IsVararg then
-    begin
-      vtab := f.VarArgTable;
-      if vtab = nil then
-      begin
-        vtab := L.Main.NewTable(0, 0);
-        f.VarArgTable := vtab;
-      end;
-      if GetEnvironmentVariable('LUA_TRACE') <> '' then
-        WriteLn(ErrOutput, 'DoCall vararg: preset=', f.VarArgPreset, ' vtab=', PtrUInt(vtab), ' [1]=', VTypeName(TableGetInt(vtab, 1)));
-      if not f.VarArgPreset then
-        ClearTable(vtab);
-      n := 0;
-      if GetEnvironmentVariable('LUA_TRACE') <> '' then
-        WriteLn(ErrOutput, 'DoCall vararg: nargs=', nargs, ' NumParams=', p.NumParams, ' base=', base);
-      for i := p.NumParams to nargs - 1 do
-      begin
-        Inc(n);
-        TableSetInt(vtab, n, L.Stack[base + i]);
-        if GetEnvironmentVariable('LUA_TRACE') <> '' then
-          WriteLn(ErrOutput, '  var[', n, ']=', VTypeName(L.Stack[base + i]));
-      end;
-      TableSetStr(vtab, L.Main.NewString('n'), LuaInt(n));
-      L.Stack[base + p.NumParams] := LuaTab(vtab);
-    end;
-    if L.Top < base + p.MaxStackSize then
-      L.Top := base + p.MaxStackSize;
-    L.CI[L.NCI - 1].Top := L.Top;
-    VMExecute(L);
-    Dec(L.NCI);
-    if nresults < 0 then
-    begin
-      n := L.Top - base;
-      for i := 0 to n - 1 do
-        L.Stack[resultBase + i] := L.Stack[base + i];
-      L.Top := resultBase + n;
-    end
-    else
-    begin
-      n := L.Top - base;
-      if n > nresults then n := nresults;
-      for i := 0 to nresults - 1 do
-      begin
-        if i < n then
-          L.Stack[resultBase + i] := L.Stack[base + i]
-        else
-          L.Stack[resultBase + i] := LuaNil;
-      end;
-      L.Top := resultBase + nresults;
-    end;
+    base := funcIdx + 1;
+    nextra := 0;
+    for i := nfix to p.MaxStackSize - 1 do
+      L.Stack[base + i].Vt := vtNil;
   end;
 end;
 
-// ---------------- numbers ----------------
+procedure VMExecute(L: TLua); forward;
 
-function VToNum(const v: TLuaValue): Double;
-begin
-  if v.Vt = vtInt then Result := Double(v.I) else Result := v.N;
-end;
-
-function LuaVToNumber(L: TThread; const v: TLuaValue; var isInt: Boolean; var iv: Int64; var nv: Double): Boolean;
-begin
-  case v.Vt of
-    vtInt: begin isInt := True; iv := v.I; nv := Double(v.I); Exit(True); end;
-    vtFlt: begin isInt := False; nv := v.N; Exit(True); end;
-    vtStr: begin
-      if StrToIntVal(v.S.ToStr, iv) then begin isInt := True; nv := Double(iv); Exit(True); end;
-      if StrToNumVal(v.S.ToStr, nv) then begin isInt := False; Exit(True); end;
-      Exit(False);
-    end;
-  end;
-  Result := False;
-end;
-
-function Arith(L: TThread; op: Byte; const a, b: TLuaValue): TLuaValue; forward;
-
-function TryIntegral(n: Double; var i: Int64; var isInt: Boolean): Boolean;
-begin
-  if isInt then
-    Exit(True);
-  if FloatToInt(n, i, 0) then
-  begin
-    isInt := True;
-    Result := True;
-  end
-  else
-    Result := False;
-end;
-
-function Arith(L: TThread; op: Byte; const a, b: TLuaValue): TLuaValue;
+procedure CallLua(L: TLua; f: TFunction; funcIdx, nargs, nresults: Integer);
 var
-  na, nb, rn: Double;
-  ia, ib, ir: Int64;
-  aInt, bInt: Boolean;
+  base, nextra: Integer;
+begin
+  if L.NCI >= ThreadMaxCI(L) + StackSlack div 9 then
+    StackOverflow(L);
+  SetupLuaFrame(L, f, funcIdx, nargs, base, nextra);
+  L.Top := base + f.Proto.MaxStackSize;
+  PushCI(L, f, funcIdx, base, L.Top, nresults, False);
+  L.CI[L.NCI - 1].NExtra := nextra;
+  VMExecute(L);
+  Dec(L.NCI);
+end;
+
+// replaces a non-function callee by its __call metamethod (shifting arguments)
+procedure TryFuncTM(L: TLua; funcIdx: Integer; var nargs: Integer);
+var
+  v, tm: TLuaValue;
   i: Integer;
-  mmName: string;
-  mm: TFunction;
 begin
-  if not LuaVToNumber(L, a, aInt, ia, na) then
+  v := L.Stack[funcIdx];
+  while v.Vt <> vtFunc do
   begin
-    case op of
-      OP_ADD: mmName := '__add'; OP_SUB: mmName := '__sub';
-      OP_MUL: mmName := '__mul'; OP_DIV: mmName := '__div';
-      OP_IDIV: mmName := '__idiv'; OP_MOD: mmName := '__mod';
-      OP_POW: mmName := '__pow'; OP_BAND: mmName := '__band';
-      OP_BOR: mmName := '__bor'; OP_BXOR: mmName := '__bxor';
-      OP_SHL: mmName := '__shl'; OP_SHR: mmName := '__shr';
-    end;
-    mm := GetMM(L.Main, a, mmName);
-    if mm = nil then
-      VMErrorVar(L, -1, Format('attempt to perform arithmetic on a %s value', [VTypeName(a)]));
-    Result := CallMeta2(L, mm, a, b);
-    Exit;
-  end;
-  if not LuaVToNumber(L, b, bInt, ib, nb) then
-  begin
-    case op of
-      OP_ADD: mmName := '__add'; OP_SUB: mmName := '__sub';
-      OP_MUL: mmName := '__mul'; OP_DIV: mmName := '__div';
-      OP_IDIV: mmName := '__idiv'; OP_MOD: mmName := '__mod';
-      OP_POW: mmName := '__pow'; OP_BAND: mmName := '__band';
-      OP_BOR: mmName := '__bor'; OP_BXOR: mmName := '__bxor';
-      OP_SHL: mmName := '__shl'; OP_SHR: mmName := '__shr';
-    end;
-    mm := GetMM(L.Main, b, mmName);
-    if mm = nil then
-      VMErrorVar(L, -1, Format('attempt to perform arithmetic on a %s value', [VTypeName(b)]));
-    Result := CallMeta2(L, mm, a, b);
-    Exit;
-  end;
-  case op of
-    OP_ADD: if aInt and bInt then begin
-        if (ib > 0) and (ia > LUA_MAXINTEGER - ib) then Result := LuaNum(na + nb)
-        else if (ib < 0) and (ia < LUA_MININTEGER - ib) then Result := LuaNum(na + nb)
-        else Result := LuaInt(ia + ib);
-      end else Result := LuaNum(na + nb);
-    OP_SUB: if aInt and bInt then begin
-        if (ib < 0) and (ia > LUA_MAXINTEGER + ib) then Result := LuaNum(na - nb)
-        else if (ib > 0) and (ia < LUA_MININTEGER + ib) then Result := LuaNum(na - nb)
-        else Result := LuaInt(ia - ib);
-      end else Result := LuaNum(na - nb);
-    OP_MUL: if aInt and bInt then begin
-        if (ia = 0) or (ib = 0) then Result := LuaInt(0)
-        else begin
-          rn := na * nb;
-          if (rn > LUA_MAXINTEGER) or (rn < LUA_MININTEGER) then Result := LuaNum(rn)
-          else Result := LuaInt(ia * ib);
-        end;
-      end else Result := LuaNum(na * nb);
-    OP_DIV: Result := LuaNum(na / nb);
-    OP_IDIV: begin
-      if aInt and bInt then begin
-        if ib = 0 then VMError(L, 'attempt to divide by zero');
-        ir := ia div ib;
-        if ((ia mod ib) <> 0) and (((ia < 0) <> (ib < 0))) then Dec(ir);
-        Result := LuaInt(ir);
-      end else begin
-        if nb = 0 then VMError(L, 'attempt to divide by zero');
-        rn := Floor(na / nb);
-        if FloatToInt(rn, ir, 0) then Result := LuaInt(ir) else Result := LuaNum(rn);
-        if GetEnvironmentVariable('LUA_TRACE') <> '' then
-          WriteLn(ErrOutput, 'IDIV: na=', na, ' nb=', nb, ' rn=', rn, ' ir=', ir);
-      end;
-    end;
-    OP_MOD: begin
-      if aInt and bInt then begin
-        if ib = 0 then VMError(L, 'attempt to perform ''n%%0''');
-        ir := ia mod ib;
-        if (ir <> 0) and (((ir < 0) <> (ib < 0))) then ir := ir + ib;
-        Result := LuaInt(ir);
-      end else begin
-        if nb = 0 then VMError(L, 'attempt to perform ''n%%0''');
-        rn := na - Floor(na / nb) * nb;
-        Result := LuaNum(rn);
-      end;
-    end;
-    OP_POW: begin
-      if aInt and bInt and (nb >= 0) and (nb <= 62) then
-      begin
-        // integer power with overflow check
-        ir := 1;
-        try
-          for i := 1 to Trunc(nb) do
-            ir := ir * ia;
-          Result := LuaInt(ir);
-        except
-          on E: Exception do
-          begin
-            // overflow: fall back to float
-            rn := Exp(nb * Ln(Abs(na)));
-            if (na < 0) and ((Trunc(nb) mod 2) <> 0) then rn := -rn;
-            Result := LuaNum(rn);
-          end;
-        end;
-      end
-      else if na < 0 then
-      begin
-        if (Frac(nb) = 0) and (abs(nb) <= 100) then
-        begin
-          try
-            rn := Exp(nb * Ln(-na));
-          except
-            rn := Infinity;
-          end;
-          if (Trunc(nb) mod 2) <> 0 then rn := -rn;
-        end
-        else if nb > 0 then
-          rn := Infinity
-        else if nb < 0 then
-          rn := 0
-        else
-          rn := NaN;
-        Result := LuaNum(rn);
-      end
-      else if na = 0 then
-      begin
-        if nb < 0 then rn := Infinity
-        else if nb = 0 then rn := 1
-        else rn := 0;
-        Result := LuaNum(rn);
-      end
-      else
-      begin
-        try
-          rn := Exp(nb * Ln(na));
-        except
-          rn := Infinity;
-        end;
-        if IsInfinite(rn) then
-          Result := LuaNum(rn)
-        else if FloatToInt(rn, ir, 0) and (abs(rn - ir) < 1e-9) then
-          Result := LuaInt(ir)
-        else
-          Result := LuaNum(rn);
-      end;
-    end;
-    OP_BAND: begin
-      TryIntegral(na, ia, aInt);
-      TryIntegral(nb, ib, bInt);
-      if not (aInt and bInt) then begin
-        mm := GetMM(L.Main, a, '__band');
-        if mm = nil then mm := GetMM(L.Main, b, '__band');
-        if mm = nil then VMError(L, 'number has no integer representation');
-        Result := CallMeta2(L, mm, a, b);
-      end else Result := LuaInt(ia and ib);
-    end;
-    OP_BOR: begin
-      TryIntegral(na, ia, aInt);
-      TryIntegral(nb, ib, bInt);
-      if not (aInt and bInt) then begin
-        mm := GetMM(L.Main, a, '__bor');
-        if mm = nil then mm := GetMM(L.Main, b, '__bor');
-        if mm = nil then VMError(L, 'number has no integer representation');
-        Result := CallMeta2(L, mm, a, b);
-      end else Result := LuaInt(ia or ib);
-    end;
-    OP_BXOR: begin
-      TryIntegral(na, ia, aInt);
-      TryIntegral(nb, ib, bInt);
-      if not (aInt and bInt) then begin
-        mm := GetMM(L.Main, a, '__bxor');
-        if mm = nil then mm := GetMM(L.Main, b, '__bxor');
-        if mm = nil then VMError(L, 'number has no integer representation');
-        Result := CallMeta2(L, mm, a, b);
-      end else Result := LuaInt(ia xor ib);
-    end;
-    OP_SHL: begin
-      TryIntegral(na, ia, aInt);
-      TryIntegral(nb, ib, bInt);
-      if not (aInt and bInt) then begin
-        mm := GetMM(L.Main, a, '__shl');
-        if mm = nil then mm := GetMM(L.Main, b, '__shl');
-        if mm = nil then VMError(L, 'number has no integer representation');
-        Result := CallMeta2(L, mm, a, b);
-      end
-      else begin
-        if ib < 0 then
-        begin
-          if -ib >= 64 then begin
-            if ia < 0 then Result := LuaInt(-1) else Result := LuaInt(0);
-          end else
-            Result := LuaInt(SarInt64(ia, -ib));
-        end
-        else if ib >= 64 then Result := LuaInt(0) else Result := LuaInt(ia shl ib);
-      end;
-    end;
-    OP_SHR: begin
-      TryIntegral(na, ia, aInt);
-      TryIntegral(nb, ib, bInt);
-      if not (aInt and bInt) then begin
-        mm := GetMM(L.Main, a, '__shr');
-        if mm = nil then mm := GetMM(L.Main, b, '__shr');
-        if mm = nil then VMError(L, 'number has no integer representation');
-        Result := CallMeta2(L, mm, a, b);
-      end
-      else begin
-        if ib < 0 then
-        begin
-          if -ib >= 64 then Result := LuaInt(0) else Result := LuaInt(ia shl (-ib));
-        end
-        else if ib >= 64 then begin
-          if ia < 0 then Result := LuaInt(-1) else Result := LuaInt(0);
-        end else
-          Result := LuaInt(SarInt64(ia, ib));
-      end;
-    end;
-  end;
-end;
-
-// ---------------- table access ----------------
-
-function TableGetMM(L: TThread; const t, key: TLuaValue; errReg: Integer): TLuaValue;
-var
-  mt: TTable;
-  idx: TLuaValue;
-begin
-  mt := GetMetatable(t);
-  if (mt = nil) and (t.Vt = vtStr) and (L.Main <> nil) then
-    mt := L.Main.MetaStr;
-  if mt = nil then
-    VMErrorVar(L, errReg, Format('attempt to index a %s value', [VTypeName(t)]));
-  idx := TableGetStr(mt, StaticStr('__index'));
-  if idx.Vt = vtFunc then
-    Result := CallMeta2(L, idx.F, t, key)
-  else if idx.Vt = vtTab then
-    Result := TableGet(idx.T, key)
-  else
-  begin
-    VMErrorVar(L, errReg, Format('attempt to index a %s value', [VTypeName(t)]));
-    Result := LuaNil;
-  end;
-end;
-
-function GetTable(L: TThread; const t, key: TLuaValue; errReg: Integer): TLuaValue;
-var
-  v: TLuaValue;
-begin
-  case t.Vt of
-    vtTab: begin
-      v := TableGet(t.T, key);
-      if IsNil(v) then
-      begin
-        if t.T.Metatable <> nil then
-        begin
-          Result := TableGetMM(L.Main, t, key, errReg);
-          Exit;
-        end;
-      end;
-      Result := v;
-    end;
-    vtUser: Result := TableGetMM(L.Main, t, key, errReg);
-    vtStr: begin
-      Result := LuaNil;
-      if L.Main.MetaStr <> nil then
-        Result := TableGetMM(L.Main, t, key, errReg);
-    end;
-  else
-    VMErrorVar(L, errReg, Format('attempt to index a %s value', [VTypeName(t)]));
-    Result := LuaNil;
-  end;
-end;
-
-procedure SetTableMM(L: TThread; const t, key, val: TLuaValue);
-var
-  mm: TFunction;
-begin
-  mm := GetMM(L.Main, t, '__newindex');
-  if mm = nil then
-    VMError(L, Format('attempt to index a %s value', [VTypeName(t)]));
-  LuaPush(L, LuaFunc(mm));
-  LuaPush(L, t);
-  LuaPush(L, key);
-  LuaPush(L, val);
-  LuaCall(L, 4, 0);
-end;
-
-procedure SetTable(L: TThread; const t, key, val: TLuaValue);
-var
-  cur: TLuaValue;
-begin
-  case t.Vt of
-    vtTab: begin
-      if key.Vt = vtNil then
-        VMError(L, 'table index is nil');
-      cur := TableGet(t.T, key);
-      if (not IsNil(cur)) or (t.T.Metatable = nil) then
-        TableSet(t.T, key, val)
-      else
-        SetTableMM(L, t, key, val);
-    end;
-    vtUser: SetTableMM(L, t, key, val);
-  else
-    VMError(L, Format('attempt to index a %s value', [VTypeName(t)]));
-  end;
-end;
-
-// ---------------- comparisons ----------------
-
-function ObjEquals(L: TThread; const a, b: TLuaValue): Boolean;
-var
-  mm: TFunction;
-  r: TLuaValue;
-begin
-  if RawEqual(a, b) then
-    Exit(True);
-  if ((a.Vt = vtTab) or (a.Vt = vtUser)) and ((b.Vt = vtTab) or (b.Vt = vtUser)) then
-  begin
-    mm := GetMM(L.Main, a, '__eq');
-    if (mm <> nil) and (mm = GetMM(L.Main, b, '__eq')) then
+    tm := GetTM(L, v, TM_CALL);
+    if tm.Vt = vtNil then
+      CallError(L, v);
+    if PendingExtra >= 15 then
     begin
-      r := CallMeta2(L, mm, a, b);
-      Exit(Truthy(r));
+      PendingExtra := 0;
+      RunError(L, '''__call'' chain too long');
+    end;
+    L.EnsureStack(L.Top + 2);
+    for i := L.Top downto funcIdx + 1 do
+      L.Stack[i] := L.Stack[i - 1];
+    Inc(L.Top);
+    Inc(nargs);
+    Inc(PendingExtra);
+    L.Stack[funcIdx] := tm;
+    v := tm;
+  end;
+end;
+
+procedure DoCall(L: TLua; funcIdx, nargs, nresults: Integer);
+var
+  f: TFunction;
+begin
+  if L.Stack[funcIdx].Vt <> vtFunc then
+    TryFuncTM(L, funcIdx, nargs);
+  f := L.Stack[funcIdx].F;
+  if f.IsC then
+    CallC(L, f, funcIdx, nargs, nresults)
+  else
+    CallLua(L, f, funcIdx, nargs, nresults);
+end;
+
+procedure IncCCalls(L: TLua);
+begin
+  Inc(L.NCcalls);
+  if L.NCcalls >= MAXCCALLS then
+  begin
+    if L.NCcalls = MAXCCALLS then
+      RunError(L, 'C stack overflow')
+    else if L.NCcalls >= MAXCCALLS + 20 then
+      raise ELuaError.CreateMsg('error in error handling');
+  end;
+end;
+
+procedure LuaCall(L: TLua; nargs, nresults: Integer);
+begin
+  IncCCalls(L);
+  Inc(L.NNY);
+  try
+    DoCall(L, L.Top - nargs - 1, nargs, nresults);
+  finally
+    Dec(L.NNY);
+    Dec(L.NCcalls);
+  end;
+end;
+
+procedure LuaCallK(L: TLua; nargs, nresults: Integer);
+begin
+  IncCCalls(L);
+  try
+    DoCall(L, L.Top - nargs - 1, nargs, nresults);
+  finally
+    Dec(L.NCcalls);
+  end;
+end;
+
+// calls f(args) from the VM (metamethods); returns its first result
+function CallMeta(L: TLua; const f: TLuaValue; const args: array of TLuaValue): TLuaValue;
+var
+  idx, i, saveTop: Integer;
+begin
+  saveTop := L.Top;
+  L.EnsureStack(saveTop + Length(args) + 2);
+  idx := saveTop;
+  L.Stack[idx] := f;
+  for i := 0 to High(args) do
+    L.Stack[idx + 1 + i] := args[i];
+  L.Top := idx + 1 + Length(args);
+  LuaCallK(L, Length(args), 1);
+  Result := L.Stack[idx];
+  L.Top := saveTop;
+end;
+
+{ ===================================================================== }
+{ hooks                                                                  }
+{ ===================================================================== }
+
+procedure SetHookState(L: TThread; const func: TLuaValue; mask, count: Integer);
+begin
+  if (func.Vt <> vtFunc) or (mask = 0) then
+  begin
+    L.HookFunc.Vt := vtNil;
+    L.HookMask := 0;
+    L.HookCount := 0;
+  end
+  else
+  begin
+    L.HookFunc := func;
+    L.HookMask := mask;
+    L.HookCount := count;
+    L.HookCounter := count;
+  end;
+end;
+
+procedure CallHook(L: TLua; const ev: string; line: Integer);
+var
+  saveTop, idx: Integer;
+  fn: TLuaValue;
+begin
+  if L.InHook or (L.HookFunc.Vt <> vtFunc) then Exit;
+  fn := L.HookFunc;
+  saveTop := L.Top;
+  if (L.NCI > 0) and (L.Top < L.CI[L.NCI - 1].Top) then
+    L.Top := L.CI[L.NCI - 1].Top;
+  idx := L.Top;
+  L.EnsureStack(idx + 6);
+  L.Stack[idx] := fn;
+  L.Stack[idx + 1] := LuaStr(L.NewString(RawByteString(ev)));
+  if line >= 0 then L.Stack[idx + 2] := LuaInt(line) else L.Stack[idx + 2].Vt := vtNil;
+  L.Top := idx + 3;
+  L.InHook := True;
+  if L.NCI > 0 then L.CI[L.NCI - 1].Hooked := True;
+  try
+    DoCall(L, idx, 2, 0);
+  finally
+    if L.NCI > 0 then L.CI[L.NCI - 1].Hooked := False;
+    L.InHook := False;
+    L.Top := saveTop;
+  end;
+end;
+
+// a call or return event: the hook can inspect the transferred values (getinfo 'r')
+procedure CallHookTransfer(L: TLua; const ev: string; ftr, ntr: Integer);
+begin
+  if L.InHook or (L.HookFunc.Vt <> vtFunc) or (L.NCI = 0) then Exit;
+  L.CI[L.NCI - 1].FTransfer := ftr;
+  L.CI[L.NCI - 1].NTransfer := ntr;
+  try
+    CallHook(L, ev, -1);
+  finally
+    L.CI[L.NCI - 1].FTransfer := 0;
+    L.CI[L.NCI - 1].NTransfer := 0;
+  end;
+end;
+
+// called before executing the instruction at 'pc'
+procedure TraceExec(L: TLua; p: TProto; pc: Integer);
+var
+  line, oldline: Integer;
+begin
+  if (L.HookMask and HOOK_INT) <> 0 then
+  begin
+    L.HookMask := L.HookMask and not HOOK_INT;
+    raise ELuaError.CreateMsg('interrupted!');
+  end;
+  if L.InHook then Exit;
+  if (L.HookMask and HOOK_COUNT) <> 0 then
+  begin
+    Dec(L.HookCounter);
+    if L.HookCounter <= 0 then
+    begin
+      L.HookCounter := L.HookCount;
+      CallHook(L, 'count', -1);
     end;
   end;
-  Result := False;
+  if (L.HookMask and HOOK_LINE) <> 0 then
+  begin
+    line := ProtoLineAt(p, pc);
+    oldline := ProtoLineAt(p, L.OldLine);
+    if (pc <= L.OldLine) or (line <> oldline) then
+      CallHook(L, 'line', line);   // without debug information the line is nil
+    L.OldLine := pc;
+  end;
 end;
 
-function ObjLess(L: TThread; const a, b: TLuaValue): Boolean;
+{ ===================================================================== }
+{ strings, comparison                                                    }
+{ ===================================================================== }
+
+function c_strcoll(a, b: PChar): Integer; cdecl; external 'c' name 'strcoll';
+function c_strlen(a: PChar): SizeUInt; cdecl; external 'c' name 'strlen';
+
+// string comparison honouring the collation locale (like strcoll), with
+// embedded zeros handled segment by segment
+function StrCompare(const a, b: RawByteString): Integer;
 var
-  mm: TFunction;
-  r: TLuaValue;
-  na, nb: Double;
+  s1, s2: PChar;
+  rl1, rl2, zl1, zl2: SizeUInt;
+  t: Integer;
 begin
-  if ((a.Vt = vtInt) or (a.Vt = vtFlt)) and ((b.Vt = vtInt) or (b.Vt = vtFlt)) then
-  begin
-    if (a.Vt = vtInt) and (b.Vt = vtInt) then Exit(a.I < b.I);
-    na := VToNum(a);
-    nb := VToNum(b);
-    Exit(na < nb);
-  end;
-  if (a.Vt = vtStr) and (b.Vt = vtStr) then
-    Exit(a.S.ToStr < b.S.ToStr);
-  mm := GetMM(L.Main, a, '__lt');
-  if mm <> nil then
-  begin
-    r := CallMeta2(L, mm, a, b);
-    Exit(Truthy(r));
-  end;
-  mm := GetMM(L.Main, b, '__lt');
-  if mm <> nil then
-  begin
-    r := CallMeta2(L, mm, b, a);
-    Exit(not Truthy(r));
-  end;
-  VMError(L, Format('attempt to compare two %s values', [VTypeName(a)]));
-  Result := False;
-end;
-
-function ObjLessEq(L: TThread; const a, b: TLuaValue): Boolean;
-var
-  mm: TFunction;
-  r: TLuaValue;
-begin
-  if ((a.Vt = vtInt) or (a.Vt = vtFlt)) and ((b.Vt = vtInt) or (b.Vt = vtFlt)) then
-  begin
-    if (a.Vt = vtInt) and (b.Vt = vtInt) then Exit(a.I <= b.I);
-    Exit(VToNum(a) <= VToNum(b));
-  end;
-  if (a.Vt = vtStr) and (b.Vt = vtStr) then
-    Exit(a.S.ToStr <= b.S.ToStr);
-  if ObjLess(L, b, a) then
-    Exit(False);
-  mm := GetMM(L.Main, a, '__le');
-  if mm <> nil then
-  begin
-    r := CallMeta2(L, mm, a, b);
-    Exit(Truthy(r));
-  end;
-  mm := GetMM(L.Main, b, '__le');
-  if mm <> nil then
-  begin
-    r := CallMeta2(L, mm, b, a);
-    Exit(not Truthy(r));
-  end;
-  VMError(L, Format('attempt to compare two %s values', [VTypeName(a)]));
-  Result := False;
-end;
-
-// ---------------- concat ----------------
-
-function IsStrNum(const v: TLuaValue): Boolean;
-begin
-  Result := (v.Vt = vtStr) or (v.Vt = vtInt) or (v.Vt = vtFlt);
-end;
-
-function ValueToStr(const v: TLuaValue): RawByteString;
-begin
-  if v.Vt = vtStr then
-    Result := v.S.ToStr
-  else
-    Result := RawByteString(NumToStr(v));
-end;
-
-// ---------------- VM ----------------
-
-procedure VMExecute(L: TThread);
-var
-  base: Integer;
-  proto: TProto;
-  code: array of TInstruction;
-  pc: Integer;
-  ins: TInstruction;
-  f: TFunction;
-  nargs, nres, i, n: Integer;
-  v, a2, b2: TLuaValue;
-  ci: TCallInfo;
-  vtab: TTable;
-  sb: RawByteString;
-  mm: TFunction;
-  cond: Boolean;
-  step: Int64;
-  cnt, lim: Double;
-  nm: string;
-  iv: Int64;
-  np: TProto;
-  nf: TFunction;
-  u: TUpval;
-begin
-  ci := L.CI[L.NCI - 1];
-  f := ci.Func;
-  proto := f.Proto;
-  code := proto.Code;
-  base := ci.Base;
-  pc := ci.SavedPC;
+  s1 := PChar(Pointer(a));
+  s2 := PChar(Pointer(b));
+  rl1 := Length(a);
+  rl2 := Length(b);
+  if s1 = nil then s1 := '';
+  if s2 = nil then s2 := '';
   while True do
   begin
-    ins := code[pc];
+    t := c_strcoll(s1, s2);
+    if t <> 0 then Exit(t);
+    zl1 := c_strlen(s1);
+    zl2 := c_strlen(s2);
+    if zl2 = rl2 then
+    begin
+      if zl1 = rl1 then Exit(0) else Exit(1);
+    end
+    else if zl1 = rl1 then
+      Exit(-1);
+    Inc(zl1);
+    Inc(zl2);
+    Inc(s1, zl1);
+    Dec(rl1, zl1);
+    Inc(s2, zl2);
+    Dec(rl2, zl2);
+  end;
+end;
+
+function StrLess(const a, b: RawByteString): Boolean;
+begin
+  Result := StrCompare(a, b) < 0;
+end;
+
+function StrLessEq(const a, b: RawByteString): Boolean;
+begin
+  Result := StrCompare(a, b) <= 0;
+end;
+
+function CallTMRes(L: TLua; const tm, a, b: TLuaValue): TLuaValue;
+begin
+  Result := CallMeta(L, tm, [a, b]);
+end;
+
+procedure OrderError(L: TLua; const a, b: TLuaValue);
+var
+  t1, t2: string;
+begin
+  t1 := ObjTypeName(L, a);
+  t2 := ObjTypeName(L, b);
+  if t1 = t2 then
+    RunError(L, Format('attempt to compare two %s values', [t1]))
+  else
+    RunError(L, Format('attempt to compare %s with %s', [t1, t2]));
+end;
+
+function LuaEquals(L: TLua; const a, b: TLuaValue): Boolean;
+var
+  tm: TLuaValue;
+begin
+  if RawEqual(a, b) then Exit(True);
+  if a.Vt <> b.Vt then Exit(False);
+  if a.Vt = vtTab then
+  begin
+    tm := GetTM(L, a, TM_EQ);
+    if tm.Vt = vtNil then tm := GetTM(L, b, TM_EQ);
+  end
+  else if a.Vt = vtUser then
+  begin
+    tm := GetTM(L, a, TM_EQ);
+    if tm.Vt = vtNil then tm := GetTM(L, b, TM_EQ);
+  end
+  else
+    Exit(False);
+  if tm.Vt = vtNil then Exit(False);
+  Result := Truthy(CallTMRes(L, tm, a, b));
+end;
+
+function LuaLessThan(L: TLua; const a, b: TLuaValue): Boolean;
+var
+  tm: TLuaValue;
+begin
+  if IsNumber(a) and IsNumber(b) then Exit(NumLess(a, b));
+  if (a.Vt = vtStr) and (b.Vt = vtStr) then Exit(StrLess(a.S.Str, b.S.Str));
+  tm := GetTM(L, a, TM_LT);
+  if tm.Vt = vtNil then tm := GetTM(L, b, TM_LT);
+  if tm.Vt = vtNil then OrderError(L, a, b);
+  Result := Truthy(CallTMRes(L, tm, a, b));
+end;
+
+function LuaLessEqual(L: TLua; const a, b: TLuaValue): Boolean;
+var
+  tm: TLuaValue;
+begin
+  if IsNumber(a) and IsNumber(b) then Exit(NumLessEq(a, b));
+  if (a.Vt = vtStr) and (b.Vt = vtStr) then Exit(StrLessEq(a.S.Str, b.S.Str));
+  tm := GetTM(L, a, TM_LE);
+  if tm.Vt = vtNil then tm := GetTM(L, b, TM_LE);
+  if tm.Vt = vtNil then OrderError(L, a, b);
+  Result := Truthy(CallTMRes(L, tm, a, b));
+end;
+
+{ ===================================================================== }
+{ table access with metamethods                                          }
+{ ===================================================================== }
+
+function FinishGet(L: TLua; const t, key: TLuaValue; kind: TOperandKind; idx: Integer): TLuaValue;
+var
+  cur, tm, v: TLuaValue;
+  loop: Integer;
+  mt: TTable;
+begin
+  cur := t;
+  for loop := 1 to MAXTAGLOOP do
+  begin
+    if cur.Vt = vtTab then
+    begin
+      v := TableGet(cur.T, key);
+      if v.Vt <> vtNil then Exit(v);
+      mt := cur.T.Metatable;
+      if mt = nil then Exit(v);
+      tm := TableGetStr(mt, TMName(TM_INDEX));
+      if tm.Vt = vtNil then Exit(v);
+    end
+    else
+    begin
+      tm := GetTM(L, cur, TM_INDEX);
+      if tm.Vt = vtNil then
+        TypeError(L, cur, 'index', kind, idx);
+    end;
+    if tm.Vt = vtFunc then
+      Exit(CallTMRes(L, tm, cur, key));
+    cur := tm;
+    kind := okNone;
+  end;
+  RunError(L, '''__index'' chain too long; possible loop');
+  Result.Vt := vtNil;
+end;
+
+procedure RawSetChecked(L: TLua; t: TTable; const key, val: TLuaValue);
+begin
+  if key.Vt = vtNil then
+    RunError(L, 'table index is nil');
+  if (key.Vt = vtFlt) and IsNaN(key.N) then
+    RunError(L, 'table index is NaN');
+  TableSet(t, key, val);
+end;
+
+procedure FinishSet(L: TLua; const t, key, val: TLuaValue; kind: TOperandKind; idx: Integer);
+var
+  cur, tm, old: TLuaValue;
+  loop: Integer;
+  mt: TTable;
+begin
+  cur := t;
+  for loop := 1 to MAXTAGLOOP do
+  begin
+    if cur.Vt = vtTab then
+    begin
+      mt := cur.T.Metatable;
+      if mt = nil then
+      begin
+        RawSetChecked(L, cur.T, key, val);
+        Exit;
+      end;
+      old := TableGet(cur.T, key);
+      if old.Vt <> vtNil then
+      begin
+        TableSet(cur.T, key, val);
+        Exit;
+      end;
+      tm := TableGetStr(mt, TMName(TM_NEWINDEX));
+      if tm.Vt = vtNil then
+      begin
+        RawSetChecked(L, cur.T, key, val);
+        Exit;
+      end;
+    end
+    else
+    begin
+      tm := GetTM(L, cur, TM_NEWINDEX);
+      if tm.Vt = vtNil then
+        TypeError(L, cur, 'index', kind, idx);
+    end;
+    if tm.Vt = vtFunc then
+    begin
+      CallMeta(L, tm, [cur, key, val]);
+      Exit;
+    end;
+    cur := tm;
+    kind := okNone;
+  end;
+  RunError(L, '''__newindex'' chain too long; possible loop');
+end;
+
+function LuaIndex(L: TLua; const t, key: TLuaValue): TLuaValue;
+begin
+  Result := FinishGet(L, t, key, okNone, 0);
+end;
+
+procedure LuaSetIndex(L: TLua; const t, key, val: TLuaValue);
+begin
+  FinishSet(L, t, key, val, okNone, 0);
+end;
+
+{ ===================================================================== }
+{ arithmetic, length, concatenation                                      }
+{ ===================================================================== }
+
+function ArithEvent(op: Integer): Integer;
+begin
+  case op of
+    OP_ADD: Result := TM_ADD;
+    OP_SUB: Result := TM_SUB;
+    OP_MUL: Result := TM_MUL;
+    OP_MOD: Result := TM_MOD;
+    OP_POW: Result := TM_POW;
+    OP_DIV: Result := TM_DIV;
+    OP_IDIV: Result := TM_IDIV;
+    OP_BAND: Result := TM_BAND;
+    OP_BOR: Result := TM_BOR;
+    OP_BXOR: Result := TM_BXOR;
+    OP_SHL: Result := TM_SHL;
+    OP_SHR: Result := TM_SHR;
+    OP_UNM: Result := TM_UNM;
+  else
+    Result := TM_BNOT;
+  end;
+end;
+
+// converts strings to numbers for arithmetic (not bitwise) operations
+function CoerceNum(const v: TLuaValue; var r: TLuaValue): Boolean;
+var
+  i: Int64;
+  n: Double;
+begin
+  case v.Vt of
+    vtInt, vtFlt: begin r := v; Exit(True); end;
+    vtStr: begin
+      if StrToIntVal(v.S.Str, i) then begin r := LuaInt(i); Exit(True); end;
+      if StrToNumVal(v.S.Str, n) then begin r := LuaNum(n); Exit(True); end;
+    end;
+  end;
+  Result := False;
+end;
+
+procedure ArithStatusError(L: TLua; st: TArithResult; const a, b: TLuaValue;
+                           ka: TOperandKind; ia: Integer; kb: TOperandKind; ib: Integer);
+var
+  tmp: Int64;
+begin
+  case st of
+    arDivZero: RunError(L, 'attempt to divide by zero');
+    arModZero: RunError(L, 'attempt to perform ''n%0''');
+    arNoInteger: begin
+      // choose the operand that cannot be converted
+      if (a.Vt = vtInt) or ((a.Vt = vtFlt) and FloatToInt(a.N, tmp, F2I_EQ)) then
+        RunError(L, Format('number%s has no integer representation', [VarInfoOf(L, kb, ib)]))
+      else
+        RunError(L, Format('number%s has no integer representation', [VarInfoOf(L, ka, ia)]));
+    end;
+  end;
+end;
+
+function ArithSlow(L: TLua; op: Integer; const a, b: TLuaValue;
+                   ka: TOperandKind; ia: Integer; kb: TOperandKind; ib: Integer): TLuaValue;
+var
+  na, nb, res: TLuaValue;
+  st: TArithResult;
+  tm: TLuaValue;
+  isBit: Boolean;
+  oname: string;
+begin
+  isBit := op in [OP_BAND, OP_BOR, OP_BXOR, OP_SHL, OP_SHR, OP_BNOT];
+  if IsNumber(a) and IsNumber(b) then
+  begin
+    st := ArithNum(op, a, b, res);
+    if st <> arOk then ArithStatusError(L, st, a, b, ka, ia, kb, ib);
+    Exit(res);
+  end;
+  // metamethods first (also for strings: a library may install them)
+  tm := GetTM(L, a, ArithEvent(op));
+  if tm.Vt = vtNil then tm := GetTM(L, b, ArithEvent(op));
+  if tm.Vt <> vtNil then
+    Exit(CallTMRes(L, tm, a, b));
+  // strings are converted to numbers in arithmetic (not bitwise) operations
+  if (not isBit) and CoerceNum(a, na) and CoerceNum(b, nb) then
+  begin
+    st := ArithNum(op, na, nb, res);
+    if st <> arOk then ArithStatusError(L, st, na, nb, ka, ia, kb, ib);
+    Exit(res);
+  end;
+  if isBit then
+  begin
+    if IsNumber(a) and IsNumber(b) then
+      ArithStatusError(L, arNoInteger, a, b, ka, ia, kb, ib)
+    else if not IsNumber(a) then
+      TypeError(L, a, 'perform bitwise operation on', ka, ia)
+    else
+      TypeError(L, b, 'perform bitwise operation on', kb, ib);
+  end;
+  if (a.Vt = vtStr) or (b.Vt = vtStr) then
+  begin
+    oname := Copy(MT_NAMES[ArithEvent(op)], 3, 100);
+    RunError(L, Format('attempt to %s a ''%s'' with a ''%s''',
+                       [oname, VTypeName(a), VTypeName(b)]));
+  end;
+  if not IsNumber(a) then
+    TypeError(L, a, 'perform arithmetic on', ka, ia)
+  else
+    TypeError(L, b, 'perform arithmetic on', kb, ib);
+  Result.Vt := vtNil;
+end;
+
+function LuaArith(L: TLua; op: Integer; const a, b: TLuaValue): TLuaValue;
+begin
+  Result := ArithSlow(L, op, a, b, okNone, 0, okNone, 0);
+end;
+
+function LuaLen(L: TLua; const v: TLuaValue): TLuaValue;
+var
+  tm: TLuaValue;
+begin
+  case v.Vt of
+    vtStr: Exit(LuaInt(v.S.Len));
+    vtTab: begin
+      if v.T.Metatable = nil then Exit(LuaInt(TableLength(v.T)));
+      tm := TableGetStr(v.T.Metatable, TMName(TM_LEN));
+      if tm.Vt = vtNil then Exit(LuaInt(TableLength(v.T)));
+    end;
+  else
+    tm := GetTM(L, v, TM_LEN);
+    if tm.Vt = vtNil then
+      TypeError(L, v, 'get length of', okNone, 0);
+  end;
+  Result := CallMeta(L, tm, [v, v]);
+end;
+
+function ToStringForConcat(const v: TLuaValue): RawByteString; inline;
+begin
+  if v.Vt = vtStr then Result := v.S.Str else Result := RawByteString(NumToStr(v));
+end;
+
+function LuaConcat2(L: TLua; const a, b: TLuaValue): TLuaValue;
+var
+  tm: TLuaValue;
+begin
+  if (a.Vt in [vtStr, vtInt, vtFlt]) and (b.Vt in [vtStr, vtInt, vtFlt]) then
+    Exit(LuaStr(L.NewString(ToStringForConcat(a) + ToStringForConcat(b))));
+  tm := GetTM(L, a, TM_CONCAT);
+  if tm.Vt = vtNil then tm := GetTM(L, b, TM_CONCAT);
+  if tm.Vt = vtNil then
+  begin
+    if a.Vt in [vtStr, vtInt, vtFlt] then
+      TypeError(L, b, 'concatenate', okNone, 0)
+    else
+      TypeError(L, a, 'concatenate', okNone, 0);
+  end;
+  Result := CallTMRes(L, tm, a, b);
+end;
+
+// R[first .. first+n-1] are concatenated into R[first]
+procedure ConcatRegs(L: TLua; first, n: Integer);
+var
+  top, total, i, k: Integer;
+  a, b, r: TLuaValue;
+  s: RawByteString;
+  tm: TLuaValue;
+  base: Integer;
+  ka: TOperandKind;
+begin
+  base := L.CI[L.NCI - 1].Base;
+  total := n;
+  top := first + n;      // exclusive
+  while total > 1 do
+  begin
+    a := L.Stack[top - 2];
+    b := L.Stack[top - 1];
+    if (a.Vt in [vtStr, vtInt, vtFlt]) and (b.Vt in [vtStr, vtInt, vtFlt]) then
+    begin
+      // collect as many strings/numbers as possible
+      k := 2;
+      while (k < total) and (L.Stack[top - k - 1].Vt in [vtStr, vtInt, vtFlt]) do
+        Inc(k);
+      s := '';
+      for i := top - k to top - 1 do
+        s := s + ToStringForConcat(L.Stack[i]);
+      L.Stack[top - k] := LuaStr(L.NewString(s));
+      Dec(total, k - 1);
+      Dec(top, k - 1);
+    end
+    else
+    begin
+      tm := GetTM(L, a, TM_CONCAT);
+      if tm.Vt = vtNil then tm := GetTM(L, b, TM_CONCAT);
+      if tm.Vt = vtNil then
+      begin
+        if a.Vt in [vtStr, vtInt, vtFlt] then
+          TypeError(L, b, 'concatenate', okReg, top - 1 - base)
+        else
+          TypeError(L, a, 'concatenate', okReg, top - 2 - base);
+      end;
+      r := CallTMRes(L, tm, a, b);
+      L.Stack[top - 2] := r;
+      Dec(total);
+      Dec(top);
+    end;
+  end;
+  ka := okNone;
+  if ka = okNone then ;
+end;
+
+{ ===================================================================== }
+{ the instruction loop                                                   }
+{ ===================================================================== }
+
+function GetRK(L: TLua; base: Integer; kk: PLuaValue; x: Integer): PLuaValue; inline;
+begin
+  if x >= 0 then Result := @L.Stack[base + x] else Result := @kk[-1 - x];
+end;
+
+function RKKind(x: Integer): TOperandKind; inline;
+begin
+  if x >= 0 then Result := okReg else Result := okNone;
+end;
+
+procedure GCCheck(L: TLua; cidx: Integer); inline;
+begin
+  if L.Main.TotalBytes >= L.Main.GCThreshold then
+    L.Main.CheckGC;
+end;
+
+// numeric 'for' preparation; returns True if the loop must be skipped
+function ForPrep(L: TLua; ra: Integer): Boolean;
+var
+  init, limit, step: TLuaValue;
+  ilimit, istep, iinit: Int64;
+  count: QWord;
+  fl, fs, fi: Double;
+  tmp: TLuaValue;
+
+  function ToNum(const v: TLuaValue; var d: Double): Boolean;
+  var
+    r: TLuaValue;
+  begin
+    Result := CoerceNum(v, r);
+    if Result then
+      if r.Vt = vtInt then d := Double(r.I) else d := r.N;
+  end;
+
+  procedure ForError(const v: TLuaValue; const what: string);
+  begin
+    RunError(L, Format('bad ''for'' %s (number expected, got %s)', [what, ObjTypeName(L, v)]));
+  end;
+
+begin
+  init := L.Stack[ra];
+  limit := L.Stack[ra + 1];
+  step := L.Stack[ra + 2];
+  if (init.Vt = vtInt) and (step.Vt = vtInt) then
+  begin
+    iinit := init.I;
+    istep := step.I;
+    if istep = 0 then RunError(L, '''for'' step is zero');
+    // compute the integer limit
+    if limit.Vt = vtInt then
+      ilimit := limit.I
+    else
+    begin
+      if limit.Vt = vtFlt then tmp := limit
+      else if not CoerceNum(limit, tmp) then ForError(limit, 'limit');
+      if tmp.Vt = vtInt then
+        ilimit := tmp.I
+      else
+      begin
+        if not FloatToInt(tmp.N, ilimit, ifthen(istep < 0, F2I_CEIL, F2I_FLOOR)) then
+        begin
+          // out of integer range (or NaN)
+          if IsNaN(tmp.N) then Exit(True);
+          if tmp.N > 0 then
+          begin
+            if istep < 0 then Exit(True);
+            ilimit := LUA_MAXINTEGER;
+          end
+          else
+          begin
+            if istep > 0 then Exit(True);
+            ilimit := LUA_MININTEGER;
+          end;
+        end;
+      end;
+    end;
+    if istep > 0 then
+    begin
+      if iinit > ilimit then Exit(True);
+      count := QWord(ilimit) - QWord(iinit);
+      if istep <> 1 then count := count div QWord(istep);
+    end
+    else
+    begin
+      if iinit < ilimit then Exit(True);
+      count := QWord(iinit) - QWord(ilimit);
+      count := count div (QWord(-(istep + 1)) + 1);
+    end;
+    L.Stack[ra] := LuaInt(Int64(count));
+    L.Stack[ra + 1] := LuaInt(istep);
+    L.Stack[ra + 2] := LuaInt(iinit);
+    Result := False;
+  end
+  else
+  begin
+    if not ToNum(limit, fl) then ForError(limit, 'limit');
+    if not ToNum(step, fs) then ForError(step, 'step');
+    if not ToNum(init, fi) then ForError(init, 'initial value');
+    if fs = 0 then RunError(L, '''for'' step is zero');
+    if fs > 0 then
+    begin
+      if fl < fi then Exit(True);
+    end
+    else if fi < fl then Exit(True);
+    L.Stack[ra] := LuaNum(fl);
+    L.Stack[ra + 1] := LuaNum(fs);
+    L.Stack[ra + 2] := LuaNum(fi);
+    Result := False;
+  end;
+end;
+
+procedure VMExecute(L: TLua);
+label
+  startfunc;
+var
+  cidx, base, pc, nextra: Integer;
+  f: TFunction;
+  p: TProto;
+  code: PInstruction;
+  kk: PLuaValue;
+  ins: PInstruction;
+  A, B, C, i, n, nargs, nres, first, funcIdx: Integer;
+  vb, vc, vt: PLuaValue;
+  ra: Integer;
+  v, key, res, tmp: TLuaValue;
+  st: TArithResult;
+  up: TUpval;
+  np: TProto;
+  nf: TFunction;
+  tbl: TTable;
+  cnt: QWord;
+  step, idx, lim: Int64;
+  fstep, flim, fidx: Double;
+  cond: Boolean;
+begin
+startfunc:
+  cidx := L.NCI - 1;
+  f := L.CI[cidx].Func;
+  p := f.Proto;
+  code := @p.Code[0];
+  if Length(p.K) > 0 then kk := @p.K[0] else kk := nil;
+  base := L.CI[cidx].Base;
+  nextra := L.CI[cidx].NExtra;
+  pc := 0;
+  if L.HookMask <> 0 then
+  begin
+    if (L.HookMask and HOOK_CALL) <> 0 then
+    begin
+      L.CI[cidx].SavedPC := 0;
+      if L.CI[cidx].IsTail then CallHookTransfer(L, 'tail call', 1, p.NumParams)
+      else CallHookTransfer(L, 'call', 1, p.NumParams);
+    end;
+    L.OldLine := 0;
+  end;
+  while True do
+  begin
+    L.CI[cidx].SavedPC := pc + 1;
+    if L.HookMask <> 0 then
+    begin
+      TraceExec(L, p, pc);
+      base := L.CI[cidx].Base;
+    end;
+    ins := @code[pc];
     Inc(pc);
-    if GetEnvironmentVariable('LUA_TRACE') <> '' then
-      if (base = 0) and (L.Stack[1].Vt = vtInt) and (L.Stack[1].I = 7) then
-        WriteLn(ErrOutput, 'WATCH Stack1=7 pc=', pc-1, ' op=', ins.Op);
-    L.CI[L.NCI - 1].SavedPC := pc;
-    case ins.Op of
-      OP_MOVE: L.Stack[base + ins.A] := L.Stack[base + ins.B];
-      OP_LOADNIL: for i := 0 to ins.B do L.Stack[base + ins.A + i] := LuaNil;
-      OP_LOADBOOL: L.Stack[base + ins.A] := LuaBool(ins.B <> 0);
-      OP_LOADK: L.Stack[base + ins.A] := proto.K[ins.B];
-      OP_GETUPVAL: begin
-        if f.Upvals[ins.B].Open <> nil then
-          L.Stack[base + ins.A] := f.Upvals[ins.B].Open^
-        else
-          L.Stack[base + ins.A] := f.Upvals[ins.B].V;
-      end;
-      OP_SETUPVAL: begin
-        if f.Upvals[ins.B].Open <> nil then
-          f.Upvals[ins.B].Open^ := L.Stack[base + ins.A]
-        else
-          f.Upvals[ins.B].V := L.Stack[base + ins.A];
-      end;
+    A := ins^.A;
+    B := ins^.B;
+    C := ins^.C;
+    case ins^.Op of
+      OP_MOVE: L.Stack[base + A] := L.Stack[base + B];
+      OP_LOADK: L.Stack[base + A] := kk[B];
+      OP_LOADNIL: for i := 0 to B do L.Stack[base + A + i].Vt := vtNil;
+      OP_LOADBOOL: L.Stack[base + A] := LuaBool(B <> 0);
+      OP_GETUPVAL: L.Stack[base + A] := f.Upvals[B].Get;
+      OP_SETUPVAL: f.Upvals[B].SetVal(L.Stack[base + A]);
       OP_GETTABUP: begin
-        if f.Upvals[ins.B].Open <> nil then
-          v := f.Upvals[ins.B].Open^
+        v := f.Upvals[B].Get;
+        key := GetRK(L, base, kk, C)^;
+        if v.Vt = vtTab then
+        begin
+          if key.Vt = vtStr then res := TableGetStr(v.T, key.S) else res := TableGet(v.T, key);
+          if (res.Vt <> vtNil) or (v.T.Metatable = nil) then
+            L.Stack[base + A] := res
+          else
+            L.Stack[base + A] := FinishGet(L, v, key, okUpval, B);
+        end
         else
-          v := f.Upvals[ins.B].V;
-        L.Stack[base + ins.A] := GetTable(L, v, proto.K[ins.C], ins.A);
+          L.Stack[base + A] := FinishGet(L, v, key, okUpval, B);
       end;
       OP_SETTABUP: begin
-        if f.Upvals[ins.A].Open <> nil then
-          v := f.Upvals[ins.A].Open^
+        v := f.Upvals[A].Get;
+        key := GetRK(L, base, kk, B)^;
+        res := GetRK(L, base, kk, C)^;
+        if (v.Vt = vtTab) and (v.T.Metatable = nil) and (key.Vt = vtStr) then
+          TableSetStr(v.T, key.S, res)
         else
-          v := f.Upvals[ins.A].V;
-        SetTable(L, v, proto.K[ins.B], L.Stack[base + ins.C]);
+          FinishSet(L, v, key, res, okUpval, A);
       end;
-      OP_GETTABLE: L.Stack[base + ins.A] := GetTable(L, L.Stack[base + ins.B], L.Stack[base + ins.C], ins.B);
-      OP_SETTABLE: SetTable(L, L.Stack[base + ins.A], L.Stack[base + ins.B], L.Stack[base + ins.C]);
-      OP_GETFIELD: L.Stack[base + ins.A] := GetTable(L, L.Stack[base + ins.B], proto.K[ins.C], ins.B);
-      OP_SETFIELD: SetTable(L, L.Stack[base + ins.A], proto.K[ins.B], L.Stack[base + ins.C]);
-      OP_NEWTABLE: L.Stack[base + ins.A] := LuaTab(L.Main.NewTable(ins.B, 0));
+      OP_GETTABLE: begin
+        v := L.Stack[base + B];
+        key := GetRK(L, base, kk, C)^;
+        if v.Vt = vtTab then
+        begin
+          if key.Vt = vtStr then res := TableGetStr(v.T, key.S)
+          else if key.Vt = vtInt then res := TableGetInt(v.T, key.I)
+          else res := TableGet(v.T, key);
+          if (res.Vt <> vtNil) or (v.T.Metatable = nil) then
+            L.Stack[base + A] := res
+          else
+            L.Stack[base + A] := FinishGet(L, v, key, okReg, B);
+        end
+        else
+          L.Stack[base + A] := FinishGet(L, v, key, okReg, B);
+      end;
+      OP_SETTABLE: begin
+        v := L.Stack[base + A];
+        key := GetRK(L, base, kk, B)^;
+        res := GetRK(L, base, kk, C)^;
+        if (v.Vt = vtTab) and (v.T.Metatable = nil) and (key.Vt in [vtStr, vtInt]) then
+        begin
+          if key.Vt = vtStr then TableSetStr(v.T, key.S, res) else TableSetInt(v.T, key.I, res);
+        end
+        else
+          FinishSet(L, v, key, res, okReg, A);
+      end;
+      OP_NEWTABLE: begin
+        L.Stack[base + A] := LuaTab(L.Main.NewTable(B, C));
+        // the new table is the topmost live register: everything above is dead
+        L.GCLimit := base + A + 1;
+        GCCheck(L, cidx);
+        L.GCLimit := 0;
+      end;
       OP_SELF: begin
-        L.Stack[base + ins.A + 1] := L.Stack[base + ins.B];
-        L.Stack[base + ins.A] := GetTable(L, L.Stack[base + ins.B], proto.K[ins.C], ins.B);
+        v := L.Stack[base + B];
+        key := GetRK(L, base, kk, C)^;
+        L.Stack[base + A + 1] := v;
+        if v.Vt = vtTab then
+        begin
+          res := TableGet(v.T, key);
+          if (res.Vt <> vtNil) or (v.T.Metatable = nil) then
+            L.Stack[base + A] := res
+          else
+            L.Stack[base + A] := FinishGet(L, v, key, okReg, B);
+        end
+        else
+          L.Stack[base + A] := FinishGet(L, v, key, okReg, B);
       end;
-      OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_IDIV, OP_MOD, OP_POW,
-      OP_BAND, OP_BOR, OP_BXOR, OP_SHL, OP_SHR:
-        L.Stack[base + ins.A] := Arith(L, ins.Op, L.Stack[base + ins.B], L.Stack[base + ins.C]);
+      OP_ADD, OP_SUB, OP_MUL, OP_MOD, OP_POW, OP_DIV, OP_IDIV,
+      OP_BAND, OP_BOR, OP_BXOR, OP_SHL, OP_SHR: begin
+        vb := GetRK(L, base, kk, B);
+        vc := GetRK(L, base, kk, C);
+        if (vb^.Vt = vtInt) and (vc^.Vt = vtInt) and (ins^.Op in [OP_ADD, OP_SUB, OP_MUL]) then
+        begin
+          case ins^.Op of
+            OP_ADD: L.Stack[base + A] := LuaInt(Int64(QWord(vb^.I) + QWord(vc^.I)));
+            OP_SUB: L.Stack[base + A] := LuaInt(Int64(QWord(vb^.I) - QWord(vc^.I)));
+          else
+            L.Stack[base + A] := LuaInt(Int64(QWord(vb^.I) * QWord(vc^.I)));
+          end;
+        end
+        else if IsNumber(vb^) and IsNumber(vc^) then
+        begin
+          st := ArithNum(ins^.Op, vb^, vc^, res);
+          if st <> arOk then
+            ArithStatusError(L, st, vb^, vc^, RKKind(B), B, RKKind(C), C);
+          L.Stack[base + A] := res;
+        end
+        else
+        begin
+          v := vb^;
+          key := vc^;
+          res := ArithSlow(L, ins^.Op, v, key, RKKind(B), B, RKKind(C), C);
+          L.Stack[base + A] := res;
+        end;
+      end;
       OP_UNM: begin
-        v := L.Stack[base + ins.B];
-        case v.Vt of
-          vtInt: L.Stack[base + ins.A] := LuaInt(-v.I);
-          vtFlt: L.Stack[base + ins.A] := LuaNum(-v.N);
-        else begin
-          mm := GetMM(L.Main, v, '__unm');
-          if mm = nil then
-            VMError(L, Format('attempt to perform arithmetic on a %s value', [VTypeName(v)]));
-          L.Stack[base + ins.A] := CallMeta1(L, mm, v);
-        end;
-        end;
+        v := L.Stack[base + B];
+        if v.Vt = vtInt then
+          L.Stack[base + A] := LuaInt(Int64(QWord(0) - QWord(v.I)))
+        else if v.Vt = vtFlt then
+          L.Stack[base + A] := LuaNum(-v.N)
+        else
+          L.Stack[base + A] := ArithSlow(L, OP_UNM, v, v, okReg, B, okReg, B);
       end;
       OP_BNOT: begin
-        v := L.Stack[base + ins.B];
-        if (v.Vt = vtInt) or ((v.Vt = vtFlt) and FloatToInt(v.N, iv, 0)) then
-        begin
-          if v.Vt = vtFlt then
-            L.Stack[base + ins.A] := LuaInt(not iv)
-          else
-            L.Stack[base + ins.A] := LuaInt(not v.I);
-        end
-        else begin
-          mm := GetMM(L.Main, v, '__bnot');
-          if mm = nil then
-            VMError(L, 'number has no integer representation');
-          L.Stack[base + ins.A] := CallMeta1(L, mm, v);
-        end;
-      end;
-      OP_NOT: L.Stack[base + ins.A] := LuaBool(IsFalse(L.Stack[base + ins.B]));
-      OP_LEN: begin
-        v := L.Stack[base + ins.B];
-        case v.Vt of
-          vtStr: L.Stack[base + ins.A] := LuaInt(v.S.Len);
-          vtTab: begin
-            mm := GetMM(L.Main, v, '__len');
-            if mm <> nil then
-              L.Stack[base + ins.A] := CallMeta1(L, mm, v)
-            else
-              L.Stack[base + ins.A] := LuaInt(TableLength(v.T));
-          end;
+        v := L.Stack[base + B];
+        if v.Vt = vtInt then
+          L.Stack[base + A] := LuaInt(not v.I)
         else
-          VMError(L, Format('attempt to get length of a %s value', [VTypeName(v)]));
+          L.Stack[base + A] := ArithSlow(L, OP_BNOT, v, v, okReg, B, okReg, B);
+      end;
+      OP_NOT: L.Stack[base + A] := LuaBool(IsFalse(L.Stack[base + B]));
+      OP_LEN: begin
+        v := L.Stack[base + B];
+        if v.Vt = vtStr then
+          L.Stack[base + A] := LuaInt(v.S.Len)
+        else if (v.Vt = vtTab) and (v.T.Metatable = nil) then
+          L.Stack[base + A] := LuaInt(TableLength(v.T))
+        else
+        begin
+          if (v.Vt <> vtTab) and (GetTM(L, v, TM_LEN).Vt = vtNil) then
+            TypeError(L, v, 'get length of', okReg, B);
+          L.Stack[base + A] := LuaLen(L, v);
         end;
       end;
       OP_CONCAT: begin
-        a2 := L.Stack[base + ins.A];
-        b2 := L.Stack[base + ins.A + 1];
-        if IsStrNum(a2) and IsStrNum(b2) then
+        ConcatRegs(L, base + B, C);
+        L.Stack[base + A] := L.Stack[base + B];
+        if L.Main.TotalBytes >= L.Main.GCThreshold then
         begin
-          sb := ValueToStr(a2) + ValueToStr(b2);
-          L.Stack[base + ins.A] := LuaStr(L.Main.NewString(sb));
-        end
-        else
-        begin
-          mm := GetMM(L.Main, a2, '__concat');
-          if mm = nil then mm := GetMM(L.Main, b2, '__concat');
-          if mm = nil then
-            VMError(L, Format('attempt to concatenate a %s value',
-                   [VTypeName(a2)]));
-          L.Stack[base + ins.A] := CallMeta2(L, mm, a2, b2);
+          if A > B then L.GCLimit := base + A + 1 else L.GCLimit := base + B + 1;
+          GCCheck(L, cidx);
+          L.GCLimit := 0;
         end;
       end;
-      OP_JMP: pc := ins.A;
-      OP_JFALSE: if IsFalse(L.Stack[base + ins.A]) then pc := ins.B;
-      OP_JTRUE: if Truthy(L.Stack[base + ins.A]) then pc := ins.B;
-      OP_TEST: begin
-        if Truthy(L.Stack[base + ins.A]) = (ins.C <> 0) then
-          pc := ins.B;
-      end;
-      OP_TESTSET: begin
-        if Truthy(L.Stack[base + ins.A]) = (ins.C <> 0) then
-          pc := ins.B
-        else
-          L.Stack[base + ins.A] := L.Stack[base + ins.B];
-      end;
+      OP_JMP: pc := A;
+      OP_JT: if Truthy(L.Stack[base + A]) then pc := B;
+      OP_JF: if IsFalse(L.Stack[base + A]) then pc := B;
       OP_EQ, OP_LT, OP_LE: begin
-        if ins.Op = OP_EQ then cond := ObjEquals(L, L.Stack[base+ins.A], L.Stack[base+ins.B])
-        else if ins.Op = OP_LT then cond := ObjLess(L, L.Stack[base+ins.A], L.Stack[base+ins.B])
-        else cond := ObjLessEq(L, L.Stack[base+ins.A], L.Stack[base+ins.B]);
-        if cond = (ins.C = 0) then
+        vb := GetRK(L, base, kk, B);
+        vc := GetRK(L, base, kk, C);
+        v := vb^;
+        key := vc^;
+        case ins^.Op of
+          OP_EQ: cond := LuaEquals(L, v, key);
+          OP_LT: cond := LuaLessThan(L, v, key);
+        else
+          cond := LuaLessEqual(L, v, key);
+        end;
+        if cond = (A <> 0) then
+          pc := code[pc].A
+        else
           Inc(pc);
       end;
-      OP_LFALSESKIP: begin
-        L.Stack[base + ins.A] := LuaBool(False);
-        Inc(pc);
-      end;
       OP_CALL: begin
-        nargs := ins.B - 1;
-        if ins.B = 0 then nargs := L.Top - (base + ins.A + 1);
-        nres := ins.C - 1;
-        if ins.C = 0 then nres := -1;
-        v := L.Stack[base + ins.A];
-        if v.Vt = vtFunc then
-          DoCall(L, v.F, nargs, nres, base + ins.A, base + ins.A + 1)
-        else if v.Vt = vtTab then
+        funcIdx := base + A;
+        if B <> 0 then
         begin
-          mm := GetMM(L.Main, v, '__call');
-          if mm = nil then
-            VMError(L, Format('attempt to call a %s value', [VTypeName(v)]));
-          // insert function at argsBase-1
-          L.Stack[base + ins.A] := LuaFunc(mm);
-          DoCall(L, mm, nargs + 1, nres, base + ins.A, base + ins.A);
+          nargs := B - 1;
+          L.Top := funcIdx + 1 + nargs;
         end
         else
-          VMError(L, Format('attempt to call a %s value', [VTypeName(v)]));
-        L.CI[L.NCI - 1].SavedPC := pc;
+          nargs := L.Top - funcIdx - 1;
+        nres := C - 1;
+        DoCall(L, funcIdx, nargs, nres);
+        if nres >= 0 then L.Top := L.CI[cidx].Top;
+        if L.Main.TotalBytes >= L.Main.GCThreshold then
+        begin
+          // after a call with fixed results only the registers up to the last result are live
+          if nres > 0 then L.GCLimit := base + A + nres;
+          GCCheck(L, cidx);
+          L.GCLimit := 0;
+        end;
+        base := L.CI[cidx].Base;
       end;
       OP_TAILCALL: begin
-        nargs := ins.B - 1;
-        if ins.B = 0 then nargs := L.Top - (base + ins.A + 1);
-        f := L.Stack[base + ins.A].F;
-        for i := 0 to nargs - 1 do
-          L.Stack[base + i] := L.Stack[base + ins.A + 1 + i];
-        L.Top := base + nargs;
-        CloseUpvals(L, base);
-        Dec(L.NCI);
-        DoCall(L, f, nargs, ci.NResults, base, base);
-        Exit;
-      end;
-      OP_RETURN: begin
-        n := ins.B - 1;
-        if ins.B = 0 then n := L.Top - (base + ins.A);
-        if (ci.NResults >= 0) and (n > ci.NResults) then n := ci.NResults;
-        for i := 0 to n - 1 do
-          L.Stack[base + i] := L.Stack[base + ins.A + i];
-        if ci.NResults >= 0 then
+        funcIdx := base + A;
+        if B <> 0 then
         begin
-          for i := n to ci.NResults - 1 do
-            L.Stack[base + i] := LuaNil;
-          L.Top := base + ci.NResults;
+          nargs := B - 1;
+          L.Top := funcIdx + 1 + nargs;
         end
         else
-          L.Top := base + n;
+          nargs := L.Top - funcIdx - 1;
+        if L.Stack[funcIdx].Vt <> vtFunc then TryFuncTM(L, funcIdx, nargs);
+        nf := L.Stack[funcIdx].F;
+        if nf.IsC then
+        begin
+          // C functions are called normally; their results are returned
+          DoCall(L, funcIdx, nargs, -1);
+          n := L.Top - funcIdx;
+          first := funcIdx;
+          nres := L.CI[cidx].NResults;
+          if (L.OpenUpvals <> nil) and (L.OpenUpvals.Idx >= base) then CloseUpvals(L, base);
+          PostCall(L, L.CI[cidx].FuncIdx, first, n, nres);
+          Exit;
+        end;
+        // Lua function: reuse the frame
         CloseUpvals(L, base);
+        if (L.NTbc > 0) and (L.TbcList[L.NTbc - 1] >= base) then CloseTbcUpTo(L, base);
+        nres := L.CI[cidx].NResults;
+        funcIdx := funcIdx;
+        n := L.CI[cidx].FuncIdx;
+        // move function and arguments down to the frame's function slot
+        for i := 0 to nargs do
+          L.Stack[n + i] := L.Stack[funcIdx + i];
+        L.Top := n + 1 + nargs;
+        // replace the frame
+        SetupLuaFrame(L, nf, n, nargs, first, nextra);
+        L.Top := first + nf.Proto.MaxStackSize;
+        L.CI[cidx].Func := nf;
+        L.CI[cidx].Base := first;
+        L.CI[cidx].Top := L.Top;
+        L.CI[cidx].NExtra := nextra;
+        L.CI[cidx].IsTail := True;
+        L.CI[cidx].ExtraArgs := PendingExtra;
+        PendingExtra := 0;
+        L.CI[cidx].SavedPC := 0;
+        goto startfunc;
+      end;
+      OP_RETURN: begin
+        first := base + A;
+        if B <> 0 then n := B - 1 else n := L.Top - first;
+        if ((L.OpenUpvals <> nil) and (L.OpenUpvals.Idx >= base)) or
+           ((L.NTbc > 0) and (L.TbcList[L.NTbc - 1] >= base)) then
+        begin
+          L.Top := first + n;
+          CloseUpvals(L, base);
+          if (L.NTbc > 0) and (L.TbcList[L.NTbc - 1] >= base) then
+          begin
+            // the values being returned must survive the closing calls
+            CloseTbcUpTo(L, base);
+          end;
+          base := L.CI[cidx].Base;
+          first := base + A;
+        end;
+        if L.HookMask <> 0 then
+        begin
+          L.Top := first + n;
+          if (L.HookMask and HOOK_RET) <> 0 then
+            CallHookTransfer(L, 'return', first - L.CI[cidx].Base + 1, n);
+          base := L.CI[cidx].Base;
+          first := base + A;
+        end;
+        PostCall(L, L.CI[cidx].FuncIdx, first, n, L.CI[cidx].NResults);
+        if L.HookMask <> 0 then
+        begin
+          // the caller continues after its call instruction
+          if cidx > 0 then L.OldLine := L.CI[cidx - 1].SavedPC - 1;
+        end;
         Exit;
       end;
       OP_VARARG: begin
-        vtab := L.Stack[base + proto.NumParams].T;
-        if GetEnvironmentVariable('LUA_TRACE') <> '' then
+        nres := C - 1;
+        if B <> 0 then
         begin
-          WriteLn(ErrOutput, 'OP_VARARG base=', base, ' A=', ins.A, ' B=', ins.B, ' vtab=', PtrUInt(vtab));
-          if vtab <> nil then
+          // named vararg parameter: the values come from its table
+          tmp := L.Stack[base + B - 1];
+          tbl := tmp.T;
+          v := TableGetStr(tbl, L.Main.NewString('n'));
+          if (v.Vt <> vtInt) or (v.I < 0) or (v.I > MAXSTACK div 2) then
+            RunError(L, 'vararg table has no proper ''n''');
+          n := Integer(v.I);
+          if nres < 0 then
           begin
-            WriteLn(ErrOutput, '  Asize=', vtab.Asize, ' nNode=', Length(vtab.Node), ' LastFree=', vtab.LastFree);
-            if vtab.Asize > 0 then
-              WriteLn(ErrOutput, '  arr0=', VTypeName(vtab.Arr[0]));
-            if Length(vtab.Node) > 0 then
-              WriteLn(ErrOutput, '  node0k=', VTypeName(vtab.Node[0].Key), ' node0v=', VTypeName(vtab.Node[0].Val), ' node0next=', vtab.Node[0].Next, ' node1k=', VTypeName(vtab.Node[1].Key), ' node1v=', VTypeName(vtab.Node[1].Val), ' node1next=', vtab.Node[1].Next);
-            WriteLn(ErrOutput, '  len=', TableLength(vtab), ' [1]=', VTypeName(TableGetInt(vtab, 1)), ' [2]=', VTypeName(TableGetInt(vtab, 2)));
-          end;
-        end;
-        if ins.B > 0 then
-        begin
-          for i := 0 to ins.B - 1 do
-            L.Stack[base + ins.A + i] := TableGetInt(vtab, i + 1);
-          L.Top := base + ins.A + ins.B;
+            L.EnsureStack(base + A + n + LUA_MINSTACK);
+            for i := 1 to n do L.Stack[base + A + i - 1] := TableGetInt(tbl, i);
+            L.Top := base + A + n;
+          end
+          else
+            for i := 1 to nres do
+              if i <= n then L.Stack[base + A + i - 1] := TableGetInt(tbl, i)
+              else L.Stack[base + A + i - 1].Vt := vtNil;
         end
         else
         begin
-          n := TableLength(vtab);
-          for i := 0 to n - 1 do
-            L.Stack[base + ins.A + i] := TableGetInt(vtab, i + 1);
-          L.Top := base + ins.A + n;
+          n := nextra;
+          if nres < 0 then
+          begin
+            L.EnsureStack(base + A + n + LUA_MINSTACK);
+            for i := 0 to n - 1 do L.Stack[base + A + i] := L.Stack[base - nextra + i];
+            L.Top := base + A + n;
+          end
+          else
+            for i := 0 to nres - 1 do
+              if i < n then L.Stack[base + A + i] := L.Stack[base - nextra + i]
+              else L.Stack[base + A + i].Vt := vtNil;
         end;
       end;
       OP_CLOSURE: begin
-        np := proto.Protos[ins.B];
-        nf := TFunction.CreateLua(L.Main, np);
+        np := p.Protos[B];
+        nf := L.Main.NewLuaFunction(np);
         for i := 0 to Length(np.UpvalDescs) - 1 do
-        begin
           if np.UpvalDescs[i].InStack then
-            u := FindOpenUpval(L, base + np.UpvalDescs[i].Idx)
+            nf.Upvals[i] := FindUpval(L, base + np.UpvalDescs[i].Idx)
           else
-            u := f.Upvals[np.UpvalDescs[i].Idx];
-          nf.Upvals[i] := u;
-        end;
-        L.Stack[base + ins.A] := LuaFunc(nf);
+            nf.Upvals[i] := f.Upvals[np.UpvalDescs[i].Idx];
+        L.Stack[base + A] := LuaFunc(nf);
+        L.GCLimit := base + A + 1;   // closures are created in the topmost register
+        GCCheck(L, cidx);
+        L.GCLimit := 0;
       end;
       OP_SETLIST: begin
-        vtab := L.Stack[base + ins.A].T;
-        if ins.B = 0 then
-          n := L.Top - (base + ins.A + 1)
-        else
-          n := ins.B;
-        for i := 0 to n - 1 do
-          TableSetInt(vtab, ins.C + i, L.Stack[base + ins.A + 1 + i]);
+        tbl := L.Stack[base + A].T;
+        if B = 0 then n := L.Top - (base + A + 1) else n := B;
+        if C + n > Length(tbl.Arr) then
+          TableResize(tbl, C + n, Length(tbl.Node));
+        for i := 1 to n do
+          TableSetInt(tbl, C + i, L.Stack[base + A + i]);
+        L.Top := L.CI[cidx].Top;
       end;
-      OP_CLOSE: CloseUpvals(L, base + ins.A);
-      OP_TBC: MarkTbc(L, base + ins.A);
+      OP_CLOSE: begin
+        CloseUpvals(L, base + A);
+        if (L.NTbc > 0) and (L.TbcList[L.NTbc - 1] >= base + A) then
+        begin
+          L.Top := L.CI[cidx].Top;
+          CloseTbcUpTo(L, base + A);
+          base := L.CI[cidx].Base;
+        end;
+      end;
+      OP_TBC: RegisterTbc(L, base + A);
       OP_FORPREP: begin
-        v := L.Stack[base + ins.A + 2];
-        if v.Vt = vtInt then step := v.I else step := Trunc(v.N);
-        v := L.Stack[base + ins.A];
-        if v.Vt = vtInt then
-          L.Stack[base + ins.A] := LuaInt(v.I - step)
-        else
-          L.Stack[base + ins.A] := LuaNum(v.N - step);
-        pc := ins.B;
+        if ForPrep(L, base + A) then pc := B;
       end;
       OP_FORLOOP: begin
-        v := L.Stack[base + ins.A + 2];
-        if v.Vt = vtInt then step := v.I else step := Trunc(v.N);
-        v := L.Stack[base + ins.A];
-        if v.Vt = vtInt then
-          L.Stack[base + ins.A] := LuaInt(v.I + step)
-        else
-          L.Stack[base + ins.A] := LuaNum(v.N + step);
-        cnt := VToNum(L.Stack[base + ins.A]);
-        lim := VToNum(L.Stack[base + ins.A + 1]);
-        if step >= 0 then cond := cnt <= lim else cond := cnt >= lim;
-        if cond then
+        ra := base + A;
+        if L.Stack[ra + 1].Vt = vtInt then
         begin
-          L.Stack[base + ins.A + 3] := L.Stack[base + ins.A];
-          pc := ins.B;
+          cnt := QWord(L.Stack[ra].I);
+          if cnt > 0 then
+          begin
+            step := L.Stack[ra + 1].I;
+            idx := Int64(QWord(L.Stack[ra + 2].I) + QWord(step));
+            L.Stack[ra] := LuaInt(Int64(cnt - 1));
+            L.Stack[ra + 2] := LuaInt(idx);
+            pc := B;
+          end;
+        end
+        else
+        begin
+          fstep := L.Stack[ra + 1].N;
+          flim := L.Stack[ra].N;
+          fidx := L.Stack[ra + 2].N + fstep;
+          if fstep > 0 then cond := fidx <= flim else cond := flim <= fidx;
+          if cond then
+          begin
+            L.Stack[ra + 2] := LuaNum(fidx);
+            pc := B;
+          end;
         end;
+      end;
+      OP_TFORPREP: begin
+        ra := base + A;
+        tmp := L.Stack[ra + 3];
+        L.Stack[ra + 3] := L.Stack[ra + 2];
+        L.Stack[ra + 2] := tmp;
+        RegisterTbc(L, ra + 2);
+        pc := B;
       end;
       OP_TFORCALL: begin
-        nargs := 2;
-        nres := ins.C;
-        L.EnsureStack(base + ins.A + 6);
-        // copy function, state, control to call base A+3 (results overwrite)
-        L.Stack[base + ins.A + 3] := L.Stack[base + ins.A];
-        L.Stack[base + ins.A + 4] := L.Stack[base + ins.A + 1];
-        L.Stack[base + ins.A + 5] := L.Stack[base + ins.A + 2];
-        if GetEnvironmentVariable('LUA_TRACE') <> '' then
-          WriteLn(ErrOutput, 'TFORCALL ctrlcopy=', L.Stack[base+ins.A+2].I, ' ctrl2=', L.Stack[base+ins.A+5].I);
-        DoCall(L, L.Stack[base + ins.A + 3].F, nargs, nres, base + ins.A + 3, base + ins.A + 4);
-        if GetEnvironmentVariable('LUA_TRACE') <> '' then
-          WriteLn(ErrOutput, 'TFORCALL post A=', ins.A, ' res0vt=', L.Stack[base+ins.A+3].Vt,
-            ' res0I=', L.Stack[base+ins.A+3].I, ' ctrlvt=', L.Stack[base+ins.A+2].Vt);
-        L.CI[L.NCI - 1].SavedPC := pc;
+        ra := base + A;
+        L.Stack[ra + 5] := L.Stack[ra + 3];
+        L.Stack[ra + 4] := L.Stack[ra + 1];
+        L.Stack[ra + 3] := L.Stack[ra];
+        L.Top := ra + 6;
+        DoCall(L, ra + 3, 2, C);
+        L.Top := L.CI[cidx].Top;
+        base := L.CI[cidx].Base;
       end;
       OP_TFORLOOP: begin
-        if GetEnvironmentVariable('LUA_TRACE') <> '' then
-          WriteLn(ErrOutput, 'TFORLOOP A=', ins.A, ' res0vt=', L.Stack[base+ins.A+3].Vt,
-            ' res0I=', L.Stack[base+ins.A+3].I, ' ctrlI=', L.Stack[base+ins.A+2].I, ' B=', ins.B);
-        if not IsNil(L.Stack[base + ins.A + 3]) then
-        begin
-          L.Stack[base + ins.A + 2] := L.Stack[base + ins.A + 3];
-          pc := ins.B;
-        end;
+        if L.Stack[base + A + 3].Vt <> vtNil then pc := B;
       end;
       OP_ERRNNIL: begin
-        if not IsNil(L.Stack[base + ins.A]) then
+        if L.Stack[base + A].Vt <> vtNil then
         begin
-          if (ins.B >= 0) and (ins.B < Length(proto.K)) and (proto.K[ins.B].Vt = vtStr) then
-            nm := proto.K[ins.B].S.ToStr
-          else
-            nm := '?';
-          VMError(L, Format('global ''%s'' already defined', [nm]));
+          key := kk[B];
+          RunError(L, Format('global ''%s'' already defined', [string(key.S.Str)]));
         end;
       end;
+      OP_GETVARG: begin
+        key := GetRK(L, base, kk, C)^;
+        L.Stack[base + A].Vt := vtNil;
+        if key.Vt = vtFlt then
+          if FloatToInt(key.N, step, F2I_EQ) then key := LuaInt(step);
+        if key.Vt = vtInt then
+        begin
+          if (key.I >= 1) and (key.I <= nextra) then
+            L.Stack[base + A] := L.Stack[base - nextra + Integer(key.I) - 1];
+        end
+        else if (key.Vt = vtStr) and (key.S.Len = 1) and (key.S.Str[1] = 'n') then
+          L.Stack[base + A] := LuaInt(nextra);
+      end;
+      OP_NOP: ;
     end;
   end;
 end;
 
-// ---------------- public API ----------------
+{ ===================================================================== }
+{ protected calls, finalizers                                            }
+{ ===================================================================== }
+
+// runs the message handler for error value 'ev'; returns the final value
+function RunHandler(L: TLua; handlerIdx: Integer; ev: TLuaValue; var status: Integer): TLuaValue;
+var
+  idx, top, nested: Integer;
+begin
+  nested := 0;   // C levels used by handlers that failed (each failure calls the handler again)
+  try
+    while True do
+    begin
+      if L.NCcalls >= MAXCCALLS + 20 then
+      begin
+        status := 2;
+        Exit(LuaStr(L.NewString('error in error handling')));
+      end;
+      if L.NCcalls = MAXCCALLS then
+        ev := LuaStr(L.NewString('C stack overflow'));
+      top := L.Top;
+      if (L.NCI > 0) and (top < L.CI[L.NCI - 1].Top) then top := L.CI[L.NCI - 1].Top;
+      L.Top := top;
+      idx := L.Top;
+      L.EnsureStack(idx + 5);
+      L.Stack[idx] := L.Stack[handlerIdx];
+      L.Stack[idx + 1] := ev;
+      L.Top := idx + 2;
+      try
+        Inc(L.NCcalls);
+        Inc(L.NNY);
+        StackSlack := 900;
+        try
+          DoCall(L, idx, 1, 1);
+        finally
+          StackSlack := 0;
+          Dec(L.NNY);
+          Dec(L.NCcalls);
+        end;
+        Exit(L.Stack[idx]);
+      except
+        on E: ELuaError do
+        begin
+          ev := ErrorValueOf(L, E);
+          Inc(L.NCcalls);
+          Inc(nested);
+        end;
+      end;
+    end;
+  finally
+    Dec(L.NCcalls, nested);
+  end;
+end;
+
+function LuaProtectedCall(L: TLua; nargs, nresults, errfunc: Integer): Integer;
+var
+  funcIdx, oldNCI, oldNNY, oldCc, oldHook, errTop: Integer;
+  oldInHook: Boolean;
+  ev: TLuaValue;
+begin
+  funcIdx := L.Top - nargs - 1;
+  oldNCI := L.NCI;
+  oldNNY := L.NNY;
+  oldCc := L.NCcalls;
+  oldInHook := L.InHook;
+  oldHook := 0;
+  if oldHook <> 0 then ;
+  try
+    IncCCalls(L);
+    DoCall(L, funcIdx, nargs, nresults);
+    Dec(L.NCcalls);
+    Result := 0;
+  except
+    on E: ELuaError do
+    begin
+      Result := 1;
+      ev := ErrorValueOf(L, E);
+      if ev.Vt = vtNil then
+        ev := LuaStr(L.NewString('<no error object>'));
+      errTop := L.Top;
+      if (L.NCI > 0) and (L.CI[L.NCI - 1].Top > errTop) then errTop := L.CI[L.NCI - 1].Top;
+      if errfunc <> 0 then
+        ev := RunHandler(L, errfunc, ev, Result);
+      // unwind (the stack above funcIdx stays intact while closing variables)
+      L.NCI := oldNCI;
+      L.NNY := oldNNY;
+      L.NCcalls := oldCc;
+      L.InHook := oldInHook;
+      L.Top := errTop;
+      CloseThreadVars(L, funcIdx, ev, True);
+      L.NCI := oldNCI;
+      L.NNY := oldNNY;
+      L.NCcalls := oldCc;
+      L.Stack[funcIdx] := ev;
+      L.Top := funcIdx + 1;
+    end;
+  end;
+end;
+
+procedure CallFinalizer(L: TLua; const obj: TLuaValue);
+var
+  tm: TLuaValue;
+  idx, top, st, savedTop: Integer;
+begin
+  tm := GetTM(L, obj, TM_GC);
+  if tm.Vt <> vtFunc then Exit;
+  savedTop := L.Top;   // an open call may be using the stack up to Top
+  top := L.Top;
+  if (L.NCI > 0) and (top < L.CI[L.NCI - 1].Top) then top := L.CI[L.NCI - 1].Top;
+  L.Top := top;
+  idx := L.Top;
+  L.EnsureStack(idx + 5);
+  L.Stack[idx] := tm;
+  L.Stack[idx + 1] := obj;
+  L.Top := idx + 2;
+  if L.NCI > 0 then L.CI[L.NCI - 1].InFinalizer := True;
+  try
+    st := LuaProtectedCall(L, 1, 0, 0);
+  finally
+    if L.NCI > 0 then L.CI[L.NCI - 1].InFinalizer := False;
+  end;
+  if st <> 0 then
+  begin
+    // errors in finalizers are only warnings
+    if L.Main.WarnProc <> nil then
+    begin
+      L.Main.WarnProc(L, 'error in ', True);
+      L.Main.WarnProc(L, '__gc', True);
+      L.Main.WarnProc(L, ' (', True);
+      if L.Stack[idx].Vt = vtStr then L.Main.WarnProc(L, L.Stack[idx].S.Str, True)
+      else L.Main.WarnProc(L, 'error object is not a string', True);
+      L.Main.WarnProc(L, ')', False);
+    end;
+    L.Top := idx;
+  end;
+  L.Top := savedTop;
+end;
+
+procedure LuaClose(L: TLua);
+var
+  m: TLua;
+  err: TLuaValue;
+  o: TGCObject;
+  i: Integer;
+begin
+  m := L.Main;
+  m.CurThread := m;
+  m.NCI := 0;
+  m.NCcalls := 0;
+  m.NNY := 0;
+  err.Vt := vtNil;
+  CloseThreadVars(m, 0, err, False);
+  m.InGC := True;
+  m.Closing := True;   // objects marked for finalization from now on are never finalized
+  try
+    // all objects with finalizers become pending, newest first; a nested close
+    // (os.exit inside a finalizer) continues with what is still pending
+    for i := m.NFinObjs - 1 downto 0 do
+    begin
+      o := m.FinObjs[i];
+      o.FinState := 0;
+      if m.NToFinalize >= Length(m.ToFinalize) then
+        SetLength(m.ToFinalize, Length(m.ToFinalize) * 2 + 16);
+      m.ToFinalize[m.NToFinalize] := o;
+      Inc(m.NToFinalize);
+    end;
+    m.NFinObjs := 0;
+    while m.NToFinalize > 0 do
+    begin
+      o := m.ToFinalize[0];
+      Move(m.ToFinalize[1], m.ToFinalize[0], (m.NToFinalize - 1) * SizeOf(TGCObject));
+      Dec(m.NToFinalize);
+      if o.ObjType = OBJ_TAB then CallFinalizer(m, LuaTab(TTable(o)))
+      else if o.ObjType = OBJ_USER then CallFinalizer(m, LuaUser(TUserdata(o)));
+    end;
+  finally
+    m.InGC := False;
+  end;
+end;
+
+procedure FinalizerBridge(L: TLua; const obj: TLuaValue);
+begin
+  CallFinalizer(TLua(L.Main.CurThread), obj);
+end;
 
 procedure LuaInitVM(L: TLua);
 begin
   SetExceptionMask([exInvalidOp, exDenormalized, exZeroDivide,
                     exOverflow, exUnderflow, exPrecision]);
   L.CurThread := L;
-  L.FinalizerProc := @CallFinalizer;
-end;
-
-procedure LuaPush(L: TThread; const v: TLuaValue);
-begin
-  L.PushValue(v);
-end;
-
-function LuaGetTop(L: TThread): Integer;
-begin
-  if L.NCI = 0 then
-    Result := L.Top
-  else
-    Result := L.Top - L.CI[L.NCI - 1].Base;
-end;
-
-function LuaAbsIndex(L: TThread; i: Integer): Integer;
-var
-  base: Integer;
-begin
-  if L.NCI = 0 then base := 0 else base := L.CI[L.NCI - 1].Base;
-  if i > 0 then
-    Result := base + i - 1
-  else
-    Result := L.Top + i;
-end;
-
-function LuaArg(L: TThread; i: Integer): TLuaValue;
-begin
-  Result := L.Stack[LuaAbsIndex(L, i)];
-end;
-
-procedure LuaSetTop(L: TThread; n: Integer);
-var
-  base: Integer;
-begin
-  if L.NCI = 0 then base := 0 else base := L.CI[L.NCI - 1].Base;
-  L.SetTop(base + n);
-end;
-
-function LuaTypeName(L: TThread; i: Integer): string;
-begin
-  Result := VTypeName(LuaArg(L, i));
-end;
-
-procedure LuaCall(L: TThread; nargs, nresults: Integer);
-var
-  f: TFunction;
-  resBase: Integer;
-begin
-  resBase := L.Top - nargs - 1;
-  if resBase < 0 then resBase := 0;
-  f := L.Stack[resBase].F;
-  DoCall(L, f, nargs, nresults, resBase, resBase + 1);
-end;
-
-function LuaProtectedCall(L: TThread; nargs, nresults, errfunc: Integer): Integer;
-var
-  f: TFunction;
-  resBase: Integer;
-  errmsg: TLuaValue;
-begin
-  resBase := L.Top - nargs - 1;
-  if resBase < 0 then resBase := 0;
-  f := L.Stack[resBase].F;
-  try
-    DoCall(L, f, nargs, nresults, resBase, resBase + 1);
-    Result := 0;
-  except
-    on E: ELuaError do
-    begin
-      errmsg := LuaStr(L.Main.NewString(RawByteString(E.Message)));
-      L.Top := resBase;
-      L.PushValue(errmsg);
-      Result := 1;
-    end;
-  end;
-end;
-
-function LuaResume(L: TThread; co: TThread; nargs: Integer): Integer;
-var
-  base: Integer;
-  i, n: Integer;
-begin
-  if co.Status = ST_DEAD then
-  begin
-    L.PushValue(LuaBool(False));
-    L.PushValue(LuaStr(L.Main.NewString('cannot resume dead coroutine')));
-    Result := 2;
-    Exit;
-  end;
-  base := co.YieldResumeBase;
-  n := co.YieldResumeN;
-  if n < 0 then n := nargs;
-  co.EnsureStack(base + n);
-  for i := 0 to n - 1 do
-  begin
-    if i < nargs then
-      co.Stack[base + i] := L.Stack[L.Top - nargs + i]
-    else
-      co.Stack[base + i] := LuaNil;
-  end;
-  co.Top := base + n;
-  co.Status := ST_OK;
-  try
-    VMExecute(co);
-    Dec(co.NCI);
-    n := co.Top - base;
-    L.PushValue(LuaBool(True));
-    for i := 0 to n - 1 do
-      L.PushValue(co.Stack[base + i]);
-    co.Status := ST_DEAD;
-    Result := 0;
-  except
-    on E: ELuaYield do
-    begin
-      co.Status := ST_YIELD;
-      L.PushValue(LuaBool(True));
-      for i := 0 to co.YieldN - 1 do
-        L.PushValue(co.YieldVals[i]);
-      Result := 1;
-    end;
-    on E: ELuaError do
-    begin
-      co.Status := ST_ERR;
-      L.PushValue(LuaBool(False));
-      L.PushValue(LuaStr(L.Main.NewString(RawByteString(E.Message))));
-      Result := 2;
-    end;
-  end;
-end;
-
-procedure LuaYield(L: TThread; nresults: Integer);
-var
-  base: Integer;
-  i: Integer;
-begin
-  base := L.CI[L.NCI - 1].Base;
-  L.YieldN := nresults;
-  SetLength(L.YieldVals, nresults);
-  for i := 0 to nresults - 1 do
-    L.YieldVals[i] := L.Stack[base + i];
-  L.Status := ST_YIELD;
-  raise ELuaYield.Create('yield');
-end;
-
-procedure CallFinalizer(L: TLua; f: TFunction; obj: TLuaValue);
-var
-  base: Integer;
-begin
-  L.CurThread := L;
-  base := L.Top;
-  L.PushValue(obj);
-  try
-    DoCall(L, f, 1, 0, base, base);
-  except
-    on E: Exception do
-    begin
-      L.Top := base;
-    end;
-  end;
+  L.FinalizerProc := @FinalizerBridge;
 end;
 
 end.

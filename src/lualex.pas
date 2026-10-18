@@ -1,11 +1,15 @@
 unit lualex;
 
 {$mode objfpc}{$H+}
+{$R-}{$Q-}
+
+// Lexer for Lua 5.5 source text.
+// Tokens are scanned one at a time; one token of lookahead is supported.
 
 interface
 
 uses
-  SysUtils, Math, luacore;
+  SysUtils, Generics.Collections, luacore;
 
 type
   TTokenKind = (
@@ -17,836 +21,681 @@ type
     tkHash, tkAmp, tkTilde, tkPipe, tkShl, tkShr, tkConcat, tkDots,
     tkEq, tkNe, tkLe, tkGe, tkLt, tkGt, tkAssign,
     tkLParen, tkRParen, tkLBrace, tkRBrace, tkLBracket, tkRBracket,
-    tkDblColon, tkSemi, tkColon, tkComma, tkDot);
+    tkDblColon, tkSemi, tkColon, tkComma, tkDot,
+    tkOther);   // any other single character (always a syntax error)
+
+  TToken = record
+    Kind: TTokenKind;
+    Str: TStringObj;
+    Int: Int64;
+    Flt: Double;
+    Name: string;
+    Ch: Char;              // for tkOther
+    First, Last: Integer;  // source range of the token text
+  end;
 
   TLexer = class
   public
     L: TLua;
-    Source: RawByteString;
-    Pos: Integer;
-    Len: Integer;
-    Line: Integer;
+    ChunkId: string;     // chunk name as shown in messages
+    Line: Integer;       // line currently being scanned
+    LastLine: Integer;   // line of the last token consumed
+    // current token
     Tok: TTokenKind;
     StrVal: TStringObj;
     IntVal: Int64;
     FltVal: Double;
     NameVal: string;
-    constructor Create(AL: TLua; const ASource: RawByteString);
+    constructor Create(AL: TLua; const ASource: RawByteString; const AChunkId: string);
+    destructor Destroy; override;
     procedure Next;
-    function Peek: TTokenKind;
-    procedure Error(const msg: string);
-    function TokenName(t: TTokenKind): string;
+    function LookAhead: TTokenKind;
+    // raises "chunk:line: msg near <current token>"
+    procedure SyntaxError(const msg: string);
+    // raises "chunk:line: msg near <near>" ('near' already formatted, may be empty)
+    procedure ErrorAt(const msg: string; const near: string);
+    // token description as in "'x' expected": quoted for symbols and keywords
+    function TokenStr(t: TTokenKind): string;
+    // description of the current token for "near" parts of messages
+    function CurTokenText: string;
+    function NewStr(const s: RawByteString): TStringObj;
   private
-    HasPeek: Boolean;
-    PeekTok: TTokenKind;
-    PeekStr: TStringObj;
-    PeekInt: Int64;
-    PeekFlt: Double;
-    PeekName: string;
+    Source: RawByteString;
+    Len: Integer;
+    Pos: Integer;
     CurCh: Char;
-    procedure Advance;
-    function ChAt(off: Integer): Char;
-    procedure SkipSpace;
-    procedure ReadLongString(nEq: Integer; isComment: Boolean);
-    function ReadNumber: TTokenKind;
-    function ReadString: TTokenKind;
-    function ReadName: TTokenKind;
-    function ReadEscapedChar: Char;
+    Buf: RawByteString;
+    BufLen: Integer;
+    Cur: TToken;
+    Ahead: TToken;
+    HasAhead: Boolean;
+    LongStrs: specialize TDictionary<RawByteString, TStringObj>;
+    procedure Advance; inline;
+    procedure Save(c: Char); inline;
+    procedure SaveAndNext; inline;
+    function AtEof: Boolean; inline;
+    procedure IncLineNumber;
+    function BufText: string;
+    function TokenText(const t: TToken): string;
+    procedure LexError(const msg: string; tk: TTokenKind);
+    procedure Scan(var t: TToken);
+    function SkipSep: Integer;
+    procedure ReadLongString(isString: Boolean; sep: Integer; var t: TToken);
+    procedure ReadString(delim: Char; var t: TToken);
+    procedure EscCheck(ok: Boolean; const msg: string);
+    function GetHexa: Integer;
+    function ReadHexaEsc: Integer;
+    function ReadDecEsc: Integer;
+    procedure ReadUtf8Esc;
+    procedure ReadNumeral(var t: TToken);
   end;
 
 implementation
 
-procedure HexToDouble(const s: string; var n: Double; var code: Integer); forward;
+const
+  ReservedWords: array[tkAnd..tkWhile] of string = (
+    'and', 'break', 'do', 'else', 'elseif', 'end', 'false', 'for',
+    'function', 'global', 'goto', 'if', 'in', 'local', 'nil', 'not',
+    'or', 'repeat', 'return', 'then', 'true', 'until', 'while');
 
-constructor TLexer.Create(AL: TLua; const ASource: RawByteString);
+  TokenNames: array[tkPlus..tkDot] of string = (
+    '+', '-', '*', '/', '//', '%', '^', '#', '&', '~', '|', '<<', '>>',
+    '..', '...', '==', '~=', '<=', '>=', '<', '>', '=',
+    '(', ')', '{', '}', '[', ']', '::', ';', ':', ',', '.');
+
+constructor TLexer.Create(AL: TLua; const ASource: RawByteString; const AChunkId: string);
 begin
   L := AL;
   Source := ASource;
   Len := Length(ASource);
+  ChunkId := AChunkId;
   Pos := 1;
   Line := 1;
-  HasPeek := False;
-  CurCh := #0;
-  if Len > 0 then
-    CurCh := ASource[1];
-  // skip UTF-8 BOM
-  if (Len >= 3) and (ASource[1] = #$EF) and (ASource[2] = #$BB) and (ASource[3] = #$BF) then
-  begin
-    Pos := 4;
-    if Pos <= Len then CurCh := ASource[Pos] else CurCh := #0;
-  end;
-  // skip first line if it starts with '#'
-  if (Pos <= Len) and (ASource[Pos] = '#') then
-  begin
-    while (Pos <= Len) and (ASource[Pos] <> #10) do
-      Inc(Pos);
-    Inc(Pos); // skip newline
-    if Pos > Len then Pos := Len + 1;
-    Line := 2;
-    if Pos <= Len then CurCh := ASource[Pos] else CurCh := #0;
-  end;
-  StrVal := nil;
-  IntVal := 0;
-  FltVal := 0;
-  NameVal := '';
+  LastLine := 1;
+  HasAhead := False;
+  SetLength(Buf, 64);
+  BufLen := 0;
+  LongStrs := specialize TDictionary<RawByteString, TStringObj>.Create;
+  if Len > 0 then CurCh := Source[1] else CurCh := #0;
   Next;
+end;
+
+destructor TLexer.Destroy;
+begin
+  LongStrs.Free;
+  inherited Destroy;
+end;
+
+// long strings with the same content share one object within a chunk
+function TLexer.NewStr(const s: RawByteString): TStringObj;
+begin
+  Result := L.NewString(s);
+  if Length(s) > LUA_MAXSHORTLEN then
+  begin
+    if not LongStrs.TryGetValue(s, Result) then
+    begin
+      Result := L.NewString(s);
+      LongStrs.Add(s, Result);
+    end;
+  end;
 end;
 
 procedure TLexer.Advance;
 begin
   Inc(Pos);
-  if Pos <= Len then
-    CurCh := Source[Pos]
-  else
-    CurCh := #0;
+  if Pos <= Len then CurCh := Source[Pos] else CurCh := #0;
 end;
 
-function TLexer.ChAt(off: Integer): Char;
-var
-  p: Integer;
+function TLexer.AtEof: Boolean;
 begin
-  // ChAt(0) is the character after CurCh
-  p := Pos + off + 1;
-  if (p >= 1) and (p <= Len) then
-    Result := Source[p]
-  else
-    Result := #0;
+  Result := Pos > Len;
 end;
 
-procedure TLexer.Error(const msg: string);
+procedure TLexer.Save(c: Char);
 begin
-  raise ELuaError.CreateMsg(Format('%s:%d: %s', ['?', Line, msg]));
+  if BufLen >= Length(Buf) then
+    SetLength(Buf, Length(Buf) * 2);
+  Inc(BufLen);
+  Buf[BufLen] := c;
 end;
 
-function TLexer.TokenName(t: TTokenKind): string;
+procedure TLexer.SaveAndNext;
 begin
-  Result := '';
-  case t of
-    tkEof: Result := '<eof>';
-    tkName: Result := '<name>';
-    tkInt, tkFlt: Result := '<number>';
-    tkString: Result := '<string>';
-    tkAnd: Result := 'and';
-    tkBreak: Result := 'break';
-    tkDo: Result := 'do';
-    tkElse: Result := 'else';
-    tkElseIf: Result := 'elseif';
-    tkEnd: Result := 'end';
-    tkFalse: Result := 'false';
-    tkFor: Result := 'for';
-    tkFunction: Result := 'function';
-    tkGlobal: Result := 'global';
-    tkGoto: Result := 'goto';
-    tkIf: Result := 'if';
-    tkIn: Result := 'in';
-    tkLocal: Result := 'local';
-    tkNil: Result := 'nil';
-    tkNot: Result := 'not';
-    tkOr: Result := 'or';
-    tkRepeat: Result := 'repeat';
-    tkReturn: Result := 'return';
-    tkThen: Result := 'then';
-    tkTrue: Result := 'true';
-    tkUntil: Result := 'until';
-    tkWhile: Result := 'while';
-    tkPlus: Result := '+';
-    tkMinus: Result := '-';
-    tkStar: Result := '*';
-    tkSlash: Result := '/';
-    tkDblSlash: Result := '//';
-    tkPercent: Result := '%';
-    tkCaret: Result := '^';
-    tkHash: Result := '#';
-    tkAmp: Result := '&';
-    tkTilde: Result := '~';
-    tkPipe: Result := '|';
-    tkShl: Result := '<<';
-    tkShr: Result := '>>';
-    tkConcat: Result := '..';
-    tkDots: Result := '...';
-    tkEq: Result := '==';
-    tkNe: Result := '~=';
-    tkLe: Result := '<=';
-    tkGe: Result := '>=';
-    tkLt: Result := '<';
-    tkGt: Result := '>';
-    tkAssign: Result := '=';
-    tkLParen: Result := '(';
-    tkRParen: Result := ')';
-    tkLBrace: Result := '{';
-    tkRBrace: Result := '}';
-    tkLBracket: Result := '[';
-    tkRBracket: Result := ']';
-    tkDblColon: Result := '::';
-    tkSemi: Result := ';';
-    tkColon: Result := ':';
-    tkComma: Result := ',';
-    tkDot: Result := '.';
-  end;
-end;
-
-procedure TLexer.SkipSpace;
-var
-  sep: string;
-  level: Integer;
-  c: Char;
-begin
-  while True do
-  begin
-    c := CurCh;
-    if (c = ' ') or (c = #9) or (c = #10) or (c = #13) or (c = #12) or (c = #11) then
-    begin
-      if c = #10 then Inc(Line);
-      Advance;
-    end
-    else if c = '-' then
-    begin
-      if ChAt(0) = '-' then
-      begin
-        Advance; Advance;   // skip --
-        // check long comment
-        if CurCh = '[' then
-        begin
-          sep := '[';
-          Advance;
-          while CurCh = '=' do
-          begin
-            sep := sep + '=';
-            Advance;
-          end;
-          if CurCh = '[' then
-          begin
-            sep := sep + '[';
-            Advance;
-            ReadLongString(Length(sep)-2, True);
-            continue;
-          end;
-        end;
-        // short comment
-        while (CurCh <> #10) and (CurCh <> #13) and (CurCh <> #0) do
-          Advance;
-      end
-      else
-        Exit;
-    end
-    else
-      Exit;
-  end;
-end;
-
-procedure TLexer.ReadLongString(nEq: Integer; isComment: Boolean);
-var
-  buf: RawByteString;
-  i, j: Integer;
-  matched: Boolean;
-begin
-  buf := '';
-  while CurCh <> #0 do
-  begin
-    if CurCh = #10 then Inc(Line);
-    if CurCh = ']' then
-    begin
-      j := 0;
-      while ChAt(j) = '=' do Inc(j);
-      if (j = nEq) and (ChAt(j) = ']') then
-      begin
-        Advance;                      // skip ]
-        for i := 1 to nEq do Advance; // skip =
-        Advance;                      // skip ]
-        if not isComment then
-          StrVal := L.NewString(buf);
-        Exit;
-      end;
-    end;
-    if not isComment then
-      buf := buf + CurCh;
-    Advance;
-  end;
-  Error('unfinished long string');
-end;
-
-function TLexer.ReadEscapedChar: Char;
-var
-  c: Char;
-  digits: Integer;
-  v: Integer;
-  hex: Integer;
-  s: string;
-  uval: Integer;
-  cnt: Integer;
-begin
-  Advance; // skip backslash
-  c := CurCh;
-  case c of
-    'a': begin Result := #7; Advance; end;
-    'b': begin Result := #8; Advance; end;
-    'f': begin Result := #12; Advance; end;
-    'n': begin Result := #10; Advance; end;
-    'r': begin Result := #13; Advance; end;
-    't': begin Result := #9; Advance; end;
-    'v': begin Result := #11; Advance; end;
-    '\': begin Result := '\'; Advance; end;
-    '"': begin Result := '"'; Advance; end;
-    '''': begin Result := ''''; Advance; end;
-    #10: begin Result := #10; Inc(Line); Advance; end;
-    #13: begin
-      Result := #10;
-      if ChAt(0) = #10 then Advance;
-      Inc(Line);
-      Advance;
-    end;
-    'x': begin
-      Advance;
-      v := 0;
-      digits := 0;
-      while digits < 2 do
-      begin
-        c := CurCh;
-        if (c >= '0') and (c <= '9') then hex := Ord(c) - Ord('0')
-        else if (c >= 'a') and (c <= 'f') then hex := Ord(c) - Ord('a') + 10
-        else if (c >= 'A') and (c <= 'F') then hex := Ord(c) - Ord('A') + 10
-        else Break;
-        v := v * 16 + hex;
-        Inc(digits);
-        Advance;
-      end;
-      if digits = 0 then Error('hexadecimal digit expected');
-      Result := Chr(v);
-    end;
-    'u': begin
-      if ChAt(0) <> '{' then
-        Error('missing ''{'' in \u{xxxx}');
-      Advance; Advance; // skip u{
-      s := '';
-      while (CurCh <> '}') and (CurCh <> #0) do
-      begin
-        s := s + CurCh;
-        Advance;
-      end;
-      if CurCh = '}' then
-        Advance
-      else
-        Error('missing ''}'' in \u{xxxx}');
-      Val('$' + s, uval, cnt);
-      if cnt <> 0 then
-        Error('invalid \u{xxxx} sequence');
-      Result := Chr(uval and $FF);
-    end;
-    'z': begin
-      Advance;
-      while (CurCh = ' ') or (CurCh = #9) or (CurCh = #10) or (CurCh = #13) do
-      begin
-        if CurCh = #10 then Inc(Line);
-        Advance;
-      end;
-      Result := #0; // caller must skip
-      Exit;
-    end;
-  else
-    if (c >= '0') and (c <= '9') then
-    begin
-      v := 0;
-      digits := 0;
-      while (digits < 3) and (CurCh >= '0') and (CurCh <= '9') do
-      begin
-        v := v * 10 + Ord(CurCh) - Ord('0');
-        Inc(digits);
-        Advance;
-      end;
-      if v > 255 then
-        Error('decimal escape too large');
-      Result := Chr(v);
-    end
-    else
-    begin
-      Result := CurCh;
-      Advance;
-    end;
-  end;
-end;
-
-function TLexer.ReadString: TTokenKind;
-var
-  quote: Char;
-  buf: RawByteString;
-  c: Char;
-  uval: Integer;
-  s: string;
-  cnt: Integer;
-begin
-  quote := CurCh;
-  Advance; // skip quote
-  buf := '';
-  while True do
-  begin
-    c := CurCh;
-    if c = #0 then
-      Error('unfinished string');
-    if c = quote then
-    begin
-      Advance;
-      Break;
-    end;
-    if c = #10 then
-      Error('unfinished string');
-    if c = '\' then
-    begin
-      // handle \u{...} specially (multi-byte)
-      if ChAt(0) = 'u' then
-      begin
-        Advance; Advance;
-        if CurCh <> '{' then Error('missing ''{'' in \u{xxxx}');
-        Advance;
-        s := '';
-        while (CurCh <> '}') and (CurCh <> #0) do
-        begin
-          s := s + CurCh;
-          Advance;
-        end;
-        if CurCh = '}' then Advance else Error('missing ''}'' in \u{xxxx}');
-        Val('$' + s, uval, cnt);
-        if cnt <> 0 then Error('invalid \u{xxxx} sequence');
-        // encode UTF-8
-        if uval < $80 then
-          buf := buf + Chr(uval)
-        else if uval < $800 then
-          buf := buf + Chr($C0 or (uval shr 6)) + Chr($80 or (uval and $3F))
-        else if uval < $10000 then
-          buf := buf + Chr($E0 or (uval shr 12)) + Chr($80 or ((uval shr 6) and $3F)) +
-                Chr($80 or (uval and $3F))
-        else
-          buf := buf + Chr($F0 or (uval shr 18)) + Chr($80 or ((uval shr 12) and $3F)) +
-                Chr($80 or ((uval shr 6) and $3F)) + Chr($80 or (uval and $3F));
-      end
-      else
-      begin
-        c := ReadEscapedChar;
-        if c <> #0 then
-          buf := buf + c;
-      end;
-    end
-    else
-    begin
-      buf := buf + c;
-      Advance;
-    end;
-  end;
-  StrVal := L.NewString(buf);
-  Result := tkString;
-end;
-
-function TLexer.ReadName: TTokenKind;
-var
-  buf: string;
-  c: Char;
-begin
-  buf := '';
-  while True do
-  begin
-    c := CurCh;
-    if ((c >= 'a') and (c <= 'z')) or ((c >= 'A') and (c <= 'Z')) or
-       ((c >= '0') and (c <= '9')) or (c = '_') then
-    begin
-      buf := buf + c;
-      Advance;
-    end
-    else
-      Break;
-  end;
-  NameVal := buf;
-  if buf = 'and' then Result := tkAnd
-  else if buf = 'break' then Result := tkBreak
-  else if buf = 'do' then Result := tkDo
-  else if buf = 'else' then Result := tkElse
-  else if buf = 'elseif' then Result := tkElseIf
-  else if buf = 'end' then Result := tkEnd
-  else if buf = 'false' then Result := tkFalse
-  else if buf = 'for' then Result := tkFor
-  else if buf = 'function' then Result := tkFunction
-  else if buf = 'global' then Result := tkGlobal
-  else if buf = 'goto' then Result := tkGoto
-  else if buf = 'if' then Result := tkIf
-  else if buf = 'in' then Result := tkIn
-  else if buf = 'local' then Result := tkLocal
-  else if buf = 'nil' then Result := tkNil
-  else if buf = 'not' then Result := tkNot
-  else if buf = 'or' then Result := tkOr
-  else if buf = 'repeat' then Result := tkRepeat
-  else if buf = 'return' then Result := tkReturn
-  else if buf = 'then' then Result := tkThen
-  else if buf = 'true' then Result := tkTrue
-  else if buf = 'until' then Result := tkUntil
-  else if buf = 'while' then Result := tkWhile
-  else
-    Result := tkName;
-end;
-
-function TLexer.ReadNumber: TTokenKind;
-var
-  buf: string;
-  isHex, isFlt: Boolean;
-  c: Char;
-  uv: QWord;
-  iv: Int64;
-  fv: Double;
-  code: Integer;
-begin
-  buf := '';
-  isHex := False;
-  isFlt := False;
-  // hex prefix
-  if (CurCh = '0') and ((ChAt(0) = 'x') or (ChAt(0) = 'X')) then
-  begin
-    isHex := True;
-    buf := '0x';
-    Advance; Advance;
-    while ((CurCh >= '0') and (CurCh <= '9')) or
-          ((CurCh >= 'a') and (CurCh <= 'f')) or
-          ((CurCh >= 'A') and (CurCh <= 'F')) or (CurCh = '.') do
-    begin
-      if CurCh = '.' then isFlt := True;
-      buf := buf + CurCh;
-      Advance;
-    end;
-    // binary exponent
-    if (CurCh = 'p') or (CurCh = 'P') then
-    begin
-      isFlt := True;
-      buf := buf + 'p';
-      Advance;
-      if (CurCh = '+') or (CurCh = '-') then
-      begin
-        buf := buf + CurCh;
-        Advance;
-      end;
-      while (CurCh >= '0') and (CurCh <= '9') do
-      begin
-        buf := buf + CurCh;
-        Advance;
-      end;
-    end;
-  end
-  else
-  begin
-    while (CurCh >= '0') and (CurCh <= '9') do
-    begin
-      buf := buf + CurCh;
-      Advance;
-    end;
-    if CurCh = '.' then
-    begin
-      isFlt := True;
-      buf := buf + '.';
-      Advance;
-      while (CurCh >= '0') and (CurCh <= '9') do
-      begin
-        buf := buf + CurCh;
-        Advance;
-      end;
-    end;
-    if (CurCh = 'e') or (CurCh = 'E') then
-    begin
-      isFlt := True;
-      buf := buf + 'e';
-      Advance;
-      if (CurCh = '+') or (CurCh = '-') then
-      begin
-        buf := buf + CurCh;
-        Advance;
-      end;
-      while (CurCh >= '0') and (CurCh <= '9') do
-      begin
-        buf := buf + CurCh;
-        Advance;
-      end;
-    end;
-  end;
-  if isHex and not isFlt then
-  begin
-    // hex integer, wrap to 64 bits
-    uv := 0;
-    for c in buf do
-    begin
-      if c in ['0'..'9'] then uv := uv * 16 + QWord(Ord(c) - Ord('0'))
-      else if c in ['a'..'f'] then uv := uv * 16 + QWord(Ord(c) - Ord('a') + 10)
-      else if c in ['A'..'F'] then uv := uv * 16 + QWord(Ord(c) - Ord('A') + 10);
-    end;
-    IntVal := Int64(uv);
-    Result := tkInt;
-  end
-  else if not isFlt then
-  begin
-    Val(buf, iv, code);
-    if code = 0 then
-    begin
-      IntVal := iv;
-      Result := tkInt;
-    end
-    else
-    begin
-      // too large for Int64; parse as float
-      Val(buf, fv, code);
-      FltVal := fv;
-      Result := tkFlt;
-    end;
-  end
-  else
-  begin
-    if isHex then
-    begin
-      // convert hex float manually
-      // format: 0xH.HHHpEE
-      fv := 0;
-      // simple parser
-      HexToDouble(buf, fv, code);
-      FltVal := fv;
-    end
-    else
-    begin
-      Val(buf, fv, code);
-      FltVal := fv;
-    end;
-    Result := tkFlt;
-  end;
-end;
-
-procedure TLexer.Next;
-var
-  c: Char;
-  buf: RawByteString;
-  i: Integer;
-  sep: string;
-begin
-  if HasPeek then
-  begin
-    Tok := PeekTok;
-    StrVal := PeekStr;
-    IntVal := PeekInt;
-    FltVal := PeekFlt;
-    NameVal := PeekName;
-    HasPeek := False;
-    Exit;
-  end;
-  SkipSpace;
-  c := CurCh;
-  if c = #0 then
-  begin
-    Tok := tkEof;
-    Exit;
-  end;
-  // long strings
-  if c = '[' then
-  begin
-    sep := '[';
-    Advance;
-    while CurCh = '=' do
-    begin
-      sep := sep + '=';
-      Advance;
-    end;
-    if CurCh = '[' then
-    begin
-      sep := sep + '[';
-      Advance;
-      ReadLongString(Length(sep)-2, False);
-      Tok := tkString;
-      Exit;
-    end;
-    Tok := tkLBracket;
-    Exit;
-  end;
-  if (c >= '0') and (c <= '9') then
-  begin
-    Tok := ReadNumber;
-    Exit;
-  end;
-  if ((c >= 'a') and (c <= 'z')) or ((c >= 'A') and (c <= 'Z')) or (c = '_') then
-  begin
-    Tok := ReadName;
-    Exit;
-  end;
-  if (c = '"') or (c = '''') then
-  begin
-    Tok := ReadString;
-    Exit;
-  end;
-  case c of
-    '+': Tok := tkPlus;
-    '-': Tok := tkMinus;
-    '*': Tok := tkStar;
-    '/': begin
-      if ChAt(0) = '/' then
-      begin
-        Advance;
-        Tok := tkDblSlash;
-      end
-      else
-        Tok := tkSlash;
-    end;
-    '%': Tok := tkPercent;
-    '^': Tok := tkCaret;
-    '#': Tok := tkHash;
-    '(': Tok := tkLParen;
-    ')': Tok := tkRParen;
-    '{': Tok := tkLBrace;
-    '}': Tok := tkRBrace;
-    ']': Tok := tkRBracket;
-    ';': Tok := tkSemi;
-    ',': Tok := tkComma;
-    '&': Tok := tkAmp;
-    '|': Tok := tkPipe;
-    '~': begin
-      if ChAt(0) = '=' then
-      begin
-        Advance;
-        Tok := tkNe;
-      end
-      else
-        Tok := tkTilde;
-    end;
-    '=': begin
-      if ChAt(0) = '=' then
-      begin
-        Advance;
-        Tok := tkEq;
-      end
-      else
-        Tok := tkAssign;
-    end;
-    '<': begin
-      if ChAt(0) = '=' then
-      begin
-        Advance;
-        Tok := tkLe;
-      end
-      else if ChAt(0) = '<' then
-      begin
-        Advance;
-        Tok := tkShl;
-      end
-      else
-        Tok := tkLt;
-    end;
-    '>': begin
-      if ChAt(0) = '=' then
-      begin
-        Advance;
-        Tok := tkGe;
-      end
-      else if ChAt(0) = '>' then
-      begin
-        Advance;
-        Tok := tkShr;
-      end
-      else
-        Tok := tkGt;
-    end;
-    '.': begin
-      if ChAt(0) = '.' then
-      begin
-        Advance;
-        if ChAt(0) = '.' then
-        begin
-          Advance;
-          Tok := tkDots;
-        end
-        else
-          Tok := tkConcat;
-      end
-      else
-        Tok := tkDot;
-    end;
-    ':': begin
-      if ChAt(0) = ':' then
-      begin
-        Advance;
-        Tok := tkDblColon;
-      end
-      else
-        Tok := tkColon;
-    end;
-  else
-    Error('unexpected symbol near ''' + c + '''');
-  end;
+  Save(CurCh);
   Advance;
 end;
 
-function TLexer.Peek: TTokenKind;
+function TLexer.BufText: string;
 begin
-  Result := Tok;
+  Result := string(Copy(Buf, 1, BufLen));
 end;
 
-// Parse a hexadecimal float string like "0x1.8p1"
-procedure HexToDouble(const s: string; var n: Double; var code: Integer);
+procedure TLexer.IncLineNumber;
 var
-  i, p: Integer;
-  negExp: Boolean;
-  exp: Integer;
-  mant: Double;
-  c: Char;
-  dig: Integer;
-  fracPos: Integer;
-  scale: Double;
+  old: Char;
 begin
-  code := 0;
-  n := 0;
-  // skip 0x
-  i := 3;
-  mant := 0;
-  fracPos := -1;
-  while i <= Length(s) do
+  old := CurCh;
+  Advance;  // skip '\n' or '\r'
+  if (CurCh in [#10, #13]) and (CurCh <> old) and not AtEof then
+    Advance;  // skip '\n\r' or '\r\n'
+  Inc(Line);
+end;
+
+function TLexer.TokenStr(t: TTokenKind): string;
+begin
+  case t of
+    tkEof: Result := '<eof>';
+    tkName: Result := '<name>';
+    tkInt: Result := '<integer>';
+    tkFlt: Result := '<number>';
+    tkString: Result := '<string>';
+    tkAnd..tkWhile: Result := '''' + ReservedWords[t] + '''';
+    tkPlus..tkDot: Result := '''' + TokenNames[t] + '''';
+  else
+    Result := '<other>';
+  end;
+end;
+
+function TLexer.TokenText(const t: TToken): string;
+begin
+  case t.Kind of
+    tkName, tkString, tkInt, tkFlt:
+      Result := '''' + string(Copy(Source, t.First, t.Last - t.First + 1)) + '''';
+    tkOther:
+      if t.Ch in [#32..#126] then Result := '''' + t.Ch + ''''
+      else Result := '''<\' + IntToStr(Ord(t.Ch)) + '>''';
+  else
+    Result := TokenStr(t.Kind);
+  end;
+end;
+
+function TLexer.CurTokenText: string;
+begin
+  Result := TokenText(Cur);
+end;
+
+procedure TLexer.ErrorAt(const msg: string; const near: string);
+begin
+  if near <> '' then
+    raise ELuaError.CreateMsg(Format('%s:%d: %s near %s', [ChunkId, Line, msg, near]))
+  else
+    raise ELuaError.CreateMsg(Format('%s:%d: %s', [ChunkId, Line, msg]));
+end;
+
+procedure TLexer.SyntaxError(const msg: string);
+begin
+  ErrorAt(msg, TokenText(Cur));
+end;
+
+// error raised while scanning: 'near' shows the partial token in the buffer
+procedure TLexer.LexError(const msg: string; tk: TTokenKind);
+begin
+  case tk of
+    tkName, tkString, tkInt, tkFlt:
+      ErrorAt(msg, '''' + BufText + '''');
+  else
+    ErrorAt(msg, TokenStr(tk));
+  end;
+end;
+
+// ---------------------------------------------------------------- scanning
+
+// reads a sequence '[=*[' or ']=*]'; returns count+2 if well formed,
+// 1 for a single bracket, 0 for a malformed delimiter
+function TLexer.SkipSep: Integer;
+var
+  count: Integer;
+  s: Char;
+begin
+  count := 0;
+  s := CurCh;
+  SaveAndNext;
+  while CurCh = '=' do
   begin
-    c := s[i];
-    if c = '.' then
+    SaveAndNext;
+    Inc(count);
+  end;
+  if CurCh = s then
+    Result := count + 2
+  else if count = 0 then
+    Result := 1
+  else
+    Result := 0;
+end;
+
+procedure TLexer.ReadLongString(isString: Boolean; sep: Integer; var t: TToken);
+var
+  startLine: Integer;
+  what: string;
+begin
+  startLine := Line;
+  SaveAndNext;  // skip second '['
+  if CurCh in [#10, #13] then
+    IncLineNumber;  // first newline is not part of the string
+  while True do
+  begin
+    if AtEof then
     begin
-      fracPos := i;
-      Inc(i);
-      continue;
+      if isString then what := 'string' else what := 'comment';
+      ErrorAt(Format('unfinished long %s (starting at line %d)', [what, startLine]), '<eof>');
     end;
-    if (c = 'p') or (c = 'P') then
-      Break;
-    if (c >= '0') and (c <= '9') then dig := Ord(c) - Ord('0')
-    else if (c >= 'a') and (c <= 'f') then dig := Ord(c) - Ord('a') + 10
-    else if (c >= 'A') and (c <= 'F') then dig := Ord(c) - Ord('A') + 10
+    case CurCh of
+      ']':
+        if SkipSep = sep then
+        begin
+          SaveAndNext;  // skip second ']'
+          Break;
+        end;
+      #10, #13:
+        begin
+          Save(#10);
+          IncLineNumber;
+          if not isString then BufLen := 0;
+        end;
     else
-    begin
-      code := 1;
-      Exit;
+      if isString then SaveAndNext else Advance;
     end;
-    mant := mant * 16 + dig;
+  end;
+  if isString then
+    t.Str := NewStr(Copy(Buf, 1 + sep, BufLen - 2 * sep));
+end;
+
+procedure TLexer.EscCheck(ok: Boolean; const msg: string);
+begin
+  if not ok then
+  begin
+    if not AtEof then SaveAndNext;  // add current char to the message
+    LexError(msg, tkString);
+  end;
+end;
+
+function TLexer.GetHexa: Integer;
+begin
+  SaveAndNext;
+  EscCheck(CurCh in ['0'..'9', 'a'..'f', 'A'..'F'], 'hexadecimal digit expected');
+  Result := HexDigitVal(CurCh);
+end;
+
+function TLexer.ReadHexaEsc: Integer;
+begin
+  Result := GetHexa;
+  Result := (Result shl 4) + GetHexa;
+  Dec(BufLen, 2);  // remove saved chars from the buffer
+end;
+
+function TLexer.ReadDecEsc: Integer;
+var
+  i: Integer;
+begin
+  Result := 0;
+  i := 0;
+  while (i < 3) and (CurCh in ['0'..'9']) do
+  begin
+    Result := 10 * Result + Ord(CurCh) - Ord('0');
+    SaveAndNext;
     Inc(i);
   end;
-  if fracPos >= 0 then
+  EscCheck(Result <= 255, 'decimal escape too large');
+  Dec(BufLen, i);
+end;
+
+procedure TLexer.ReadUtf8Esc;
+var
+  i, n: Integer;
+  r, x, mfb: QWord;
+  tmp: array[0..7] of Char;
+begin
+  i := 4;  // chars to be removed: '\', 'u', '{', and first digit
+  SaveAndNext;  // skip 'u'
+  EscCheck(CurCh = '{', 'missing ''{''');
+  r := GetHexa;  // must have at least one digit
+  SaveAndNext;
+  while CurCh in ['0'..'9', 'a'..'f', 'A'..'F'] do
   begin
-    scale := 1.0 / 16.0;
-    for p := fracPos + 1 to i - 1 do
-    begin
-      c := s[p];
-      if (c >= '0') and (c <= '9') then dig := Ord(c) - Ord('0')
-      else if (c >= 'a') and (c <= 'f') then dig := Ord(c) - Ord('a') + 10
-      else dig := Ord(c) - Ord('A') + 10;
-      mant := mant + dig * scale;
-      scale := scale / 16.0;
+    Inc(i);
+    EscCheck(r <= ($7FFFFFFF shr 4), 'UTF-8 value too large');
+    r := (r shl 4) + QWord(HexDigitVal(CurCh));
+    SaveAndNext;
+  end;
+  EscCheck(CurCh = '}', 'missing ''}''');
+  Advance;  // skip '}'
+  Dec(BufLen, i);  // remove saved chars from the buffer
+  // encode r as UTF-8 (up to 6 bytes)
+  if r < $80 then
+  begin
+    Save(Chr(r));
+    Exit;
+  end;
+  n := 1;
+  x := r;
+  mfb := $3f;  // maximum that fits in the first byte
+  repeat
+    tmp[8 - n] := Chr($80 or (x and $3f));
+    Inc(n);
+    x := x shr 6;
+    mfb := mfb shr 1;
+  until x <= mfb;
+  tmp[8 - n] := Chr((((not mfb) shl 1) and $FF) or x);
+  for i := 8 - n to 7 do
+    Save(tmp[i]);
+end;
+
+procedure TLexer.ReadString(delim: Char; var t: TToken);
+type
+  TAfter = (afReadSave, afOnlySave, afNoSave);
+var
+  c: Integer;
+  after: TAfter;
+begin
+  SaveAndNext;  // keep delimiter (for error messages)
+  while CurCh <> delim do
+  begin
+    if AtEof then
+      LexError('unfinished string', tkEof);
+    case CurCh of
+      #10, #13:
+        LexError('unfinished string', tkString);
+      '\':
+        begin
+          SaveAndNext;  // keep '\' for error messages
+          c := 0;
+          after := afReadSave;
+          case CurCh of
+            'a': c := 7;
+            'b': c := 8;
+            'f': c := 12;
+            'n': c := 10;
+            'r': c := 13;
+            't': c := 9;
+            'v': c := 11;
+            'x': c := ReadHexaEsc;
+            'u': begin ReadUtf8Esc; after := afNoSave; end;
+            #10, #13:
+              begin
+                IncLineNumber;
+                c := 10;
+                after := afOnlySave;
+              end;
+            '\', '"', '''': c := Ord(CurCh);
+          else
+            if AtEof then
+              after := afNoSave  // will raise an error in the next iteration
+            else if CurCh = 'z' then
+            begin
+              Dec(BufLen);  // remove '\'
+              Advance;      // skip the 'z'
+              while (CurCh in [' ', #9, #10, #11, #12, #13]) and not AtEof do
+                if CurCh in [#10, #13] then IncLineNumber else Advance;
+              after := afNoSave;
+            end
+            else
+            begin
+              EscCheck(CurCh in ['0'..'9'], 'invalid escape sequence');
+              c := ReadDecEsc;
+              after := afOnlySave;
+            end;
+          end;
+          if after = afReadSave then
+            Advance;
+          if after <> afNoSave then
+          begin
+            Dec(BufLen);  // remove '\'
+            Save(Chr(c));
+          end;
+        end;
+    else
+      SaveAndNext;
     end;
   end;
-  exp := 0;
-  if i <= Length(s) then
+  SaveAndNext;  // skip closing delimiter
+  t.Str := NewStr(Copy(Buf, 2, BufLen - 2));
+end;
+
+procedure TLexer.ReadNumeral(var t: TToken);
+var
+  expo: string;
+  iv: Int64;
+  fv: Double;
+  txt: RawByteString;
+begin
+  expo := 'Ee';
+  if CurCh = '0' then
   begin
-    Inc(i); // skip p
-    negExp := False;
-    if (i <= Length(s)) and ((s[i] = '+') or (s[i] = '-')) then
+    SaveAndNext;
+    if CurCh in ['x', 'X'] then
     begin
-      negExp := s[i] = '-';
-      Inc(i);
+      expo := 'Pp';
+      SaveAndNext;
     end;
-    while i <= Length(s) do
-    begin
-      exp := exp * 10 + Ord(s[i]) - Ord('0');
-      Inc(i);
-    end;
-    if negExp then exp := -exp;
   end;
-  n := mant * Power(2.0, exp);
+  while True do
+  begin
+    if (CurCh <> #0) and (System.Pos(CurCh, expo) > 0) then
+    begin
+      SaveAndNext;
+      if CurCh in ['+', '-'] then SaveAndNext;
+    end
+    else if CurCh in ['0'..'9', 'a'..'f', 'A'..'F', '.'] then
+      SaveAndNext
+    else
+      Break;
+  end;
+  if CurCh in ['a'..'z', 'A'..'Z', '_'] then
+    SaveAndNext;  // force an error
+  txt := Copy(Buf, 1, BufLen);
+  if StrToIntVal(txt, iv) then
+  begin
+    t.Kind := tkInt;
+    t.Int := iv;
+  end
+  else if StrToNumVal(txt, fv) then
+  begin
+    t.Kind := tkFlt;
+    t.Flt := fv;
+  end
+  else
+    LexError('malformed number', tkFlt);
+end;
+
+procedure TLexer.Scan(var t: TToken);
+var
+  sep: Integer;
+  c: Char;
+  k: TTokenKind;
+begin
+  t.Str := nil;
+  t.Name := '';
+  BufLen := 0;
+  while True do
+  begin
+    t.First := Pos;
+    if AtEof then
+    begin
+      t.Kind := tkEof;
+      Break;
+    end;
+    c := CurCh;
+    case c of
+      #10, #13:
+        begin
+          IncLineNumber;
+          Continue;
+        end;
+      ' ', #12, #9, #11:
+        begin
+          Advance;
+          Continue;
+        end;
+      '-':
+        begin
+          Advance;
+          if CurCh <> '-' then
+          begin
+            t.Kind := tkMinus;
+            Break;
+          end;
+          Advance;
+          if CurCh = '[' then
+          begin
+            sep := SkipSep;
+            BufLen := 0;
+            if sep >= 2 then
+            begin
+              ReadLongString(False, sep, t);
+              BufLen := 0;
+              Continue;
+            end;
+          end;
+          while not (CurCh in [#10, #13]) and not AtEof do
+            Advance;
+          Continue;
+        end;
+      '[':
+        begin
+          sep := SkipSep;
+          if sep >= 2 then
+          begin
+            ReadLongString(True, sep, t);
+            t.Kind := tkString;
+          end
+          else if sep = 0 then
+            LexError('invalid long string delimiter', tkString)
+          else
+            t.Kind := tkLBracket;
+          Break;
+        end;
+      '=':
+        begin
+          Advance;
+          if CurCh = '=' then begin Advance; t.Kind := tkEq; end else t.Kind := tkAssign;
+          Break;
+        end;
+      '<':
+        begin
+          Advance;
+          if CurCh = '=' then begin Advance; t.Kind := tkLe; end
+          else if CurCh = '<' then begin Advance; t.Kind := tkShl; end
+          else t.Kind := tkLt;
+          Break;
+        end;
+      '>':
+        begin
+          Advance;
+          if CurCh = '=' then begin Advance; t.Kind := tkGe; end
+          else if CurCh = '>' then begin Advance; t.Kind := tkShr; end
+          else t.Kind := tkGt;
+          Break;
+        end;
+      '/':
+        begin
+          Advance;
+          if CurCh = '/' then begin Advance; t.Kind := tkDblSlash; end else t.Kind := tkSlash;
+          Break;
+        end;
+      '~':
+        begin
+          Advance;
+          if CurCh = '=' then begin Advance; t.Kind := tkNe; end else t.Kind := tkTilde;
+          Break;
+        end;
+      ':':
+        begin
+          Advance;
+          if CurCh = ':' then begin Advance; t.Kind := tkDblColon; end else t.Kind := tkColon;
+          Break;
+        end;
+      '"', '''':
+        begin
+          ReadString(c, t);
+          t.Kind := tkString;
+          Break;
+        end;
+      '.':
+        begin
+          SaveAndNext;
+          if CurCh = '.' then
+          begin
+            Advance;
+            if CurCh = '.' then begin Advance; t.Kind := tkDots; end
+            else t.Kind := tkConcat;
+          end
+          else if not (CurCh in ['0'..'9']) then
+            t.Kind := tkDot
+          else
+            ReadNumeral(t);
+          Break;
+        end;
+      '0'..'9':
+        begin
+          ReadNumeral(t);
+          Break;
+        end;
+      'a'..'z', 'A'..'Z', '_':
+        begin
+          repeat
+            SaveAndNext;
+          until not (CurCh in ['a'..'z', 'A'..'Z', '_', '0'..'9']);
+          t.Name := BufText;
+          t.Kind := tkName;
+          for k := tkAnd to tkWhile do
+            if (ReservedWords[k] = t.Name) and (k <> tkGlobal) then  // 'global' is contextual
+            begin
+              t.Kind := k;
+              Break;
+            end;
+          Break;
+        end;
+      '+': begin Advance; t.Kind := tkPlus; Break; end;
+      '*': begin Advance; t.Kind := tkStar; Break; end;
+      '%': begin Advance; t.Kind := tkPercent; Break; end;
+      '^': begin Advance; t.Kind := tkCaret; Break; end;
+      '#': begin Advance; t.Kind := tkHash; Break; end;
+      '&': begin Advance; t.Kind := tkAmp; Break; end;
+      '|': begin Advance; t.Kind := tkPipe; Break; end;
+      '(': begin Advance; t.Kind := tkLParen; Break; end;
+      ')': begin Advance; t.Kind := tkRParen; Break; end;
+      '{': begin Advance; t.Kind := tkLBrace; Break; end;
+      '}': begin Advance; t.Kind := tkRBrace; Break; end;
+      ']': begin Advance; t.Kind := tkRBracket; Break; end;
+      ';': begin Advance; t.Kind := tkSemi; Break; end;
+      ',': begin Advance; t.Kind := tkComma; Break; end;
+    else
+      begin
+        t.Kind := tkOther;
+        t.Ch := c;
+        Advance;
+        Break;
+      end;
+    end;
+  end;
+  t.Last := Pos - 1;
+end;
+
+procedure TLexer.Next;
+begin
+  LastLine := Line;
+  if HasAhead then
+  begin
+    Cur := Ahead;
+    HasAhead := False;
+  end
+  else
+    Scan(Cur);
+  Tok := Cur.Kind;
+  StrVal := Cur.Str;
+  IntVal := Cur.Int;
+  FltVal := Cur.Flt;
+  NameVal := Cur.Name;
+end;
+
+function TLexer.LookAhead: TTokenKind;
+begin
+  if not HasAhead then
+  begin
+    Scan(Ahead);
+    HasAhead := True;
+  end;
+  Result := Ahead.Kind;
 end;
 
 end.
