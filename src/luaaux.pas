@@ -39,8 +39,30 @@ function CheckFunction(L: TLua; arg: Integer): TFunction;
 function CheckOption(L: TLua; arg: Integer; const def: string; const opts: array of string): Integer;
 function ToIntegerArg(L: TLua; arg: Integer; var v: Int64): Boolean;
 
+// ---- growable byte buffer (like luaL_Buffer) for building strings without temporaries
+type
+  TBuf = record
+    P: PByte;
+    Len, Cap: SizeInt;
+  end;
+procedure BufInit(var b: TBuf);
+procedure BufAdd(var b: TBuf; p: PByte; n: SizeInt);
+procedure BufAddByte(var b: TBuf; c: Byte);
+procedure BufAddStr(var b: TBuf; const s: RawByteString);
+procedure BufFree(var b: TBuf);
+
+// ---- character classes of the current C locale (tables, rebuilt by RefreshCType)
+const
+  CT_ALPHA = 1; CT_DIGIT = 2; CT_LOWER = 4; CT_UPPER = 8; CT_SPACE = 16;
+  CT_CNTRL = 32; CT_GRAPH = 64; CT_PUNCT = 128; CT_XDIGIT = 256; CT_ALNUM = 512;
+var
+  CTypeTab: array[0..255] of Word;
+  ToLowerTab, ToUpperTab: array[0..255] of Byte;
+procedure RefreshCType;   // call after the locale changed
+
 // ---- results
 procedure PushStr(L: TLua; const s: RawByteString);
+procedure PushBuf(L: TLua; p: PByte; n: SizeUInt);   // a string made from raw bytes
 procedure PushNil(L: TLua);
 procedure PushBool(L: TLua; b: Boolean);
 procedure PushInt(L: TLua; i: Int64);
@@ -49,16 +71,16 @@ procedure PushFail(L: TLua);
 procedure PushCFunction(L: TLua; f: TCFunc);
 
 // ---- conversions
-function ToStringAux(L: TLua; const v: TLuaValue): RawByteString;    // luaL_tolstring
-function PointerString(const v: TLuaValue): string;
+function ToStringAux(L: TLua; constref v: TLuaValue): RawByteString;    // luaL_tolstring
+function PointerString(constref v: TLuaValue): string;
 
 // ---- registration
-procedure SetField(L: TLua; t: TTable; const name: string; const v: TLuaValue);
+procedure SetField(L: TLua; t: TTable; const name: string; constref v: TLuaValue);
 procedure RegisterFuncs(L: TLua; t: TTable; const funcs: array of TLibFunc);
 function NewLib(L: TLua; const name: string; const funcs: array of TLibFunc): TTable;
 function LightC(L: TLua; f: TCFunc; const name: string): TFunction;
 function GetLoaded(L: TLua): TTable;
-procedure SetLoaded(L: TLua; const name: string; const v: TLuaValue);
+procedure SetLoaded(L: TLua; const name: string; constref v: TLuaValue);
 function NewMetatable(L: TLua; const tname: string): TTable;
 function GetMetatableByName(L: TLua; const tname: string): TTable;
 
@@ -205,12 +227,12 @@ end;
 
 function ArgIsNone(L: TLua; arg: Integer): Boolean;
 begin
-  Result := LuaGetTop(L) < arg;
+  Result := L.Top - L.CI[L.NCI - 1].Base < arg;
 end;
 
 function ArgIsNoneOrNil(L: TLua; arg: Integer): Boolean;
 begin
-  Result := (LuaGetTop(L) < arg) or (LuaArg(L, arg).Vt = vtNil);
+  Result := ArgPtr(L, arg)^.Vt = vtNil;
 end;
 
 procedure CheckAny(L: TLua; arg: Integer);
@@ -228,8 +250,8 @@ var
   v: TLuaValue;
   n: Double;
 begin
+  if ArgPtr(L, arg)^.Vt = vtInt then Exit(ArgPtr(L, arg)^.I);
   v := LuaArg(L, arg);
-  if v.Vt = vtInt then Exit(v.I);
   if ToInteger(v, Result) then Exit;
   if ToNumberVal(v, n) then
     ArgError(L, arg, 'number has no integer representation')
@@ -280,6 +302,7 @@ var
   v: TLuaValue;
   idx: Integer;
 begin
+  if ArgPtr(L, arg)^.Vt = vtStr then Exit(ArgPtr(L, arg)^.S);
   v := LuaArg(L, arg);
   case v.Vt of
     vtStr: Exit(v.S);
@@ -347,6 +370,99 @@ begin
   LuaPush(L, LuaStr(L.NewString(s)));
 end;
 
+function c_isalpha_(c: Integer): Integer; cdecl; external 'c' name 'isalpha';
+function c_islower_(c: Integer): Integer; cdecl; external 'c' name 'islower';
+function c_isupper_(c: Integer): Integer; cdecl; external 'c' name 'isupper';
+function c_isspace_(c: Integer): Integer; cdecl; external 'c' name 'isspace';
+function c_iscntrl_(c: Integer): Integer; cdecl; external 'c' name 'iscntrl';
+function c_isgraph_(c: Integer): Integer; cdecl; external 'c' name 'isgraph';
+function c_ispunct_(c: Integer): Integer; cdecl; external 'c' name 'ispunct';
+function c_isxdigit_(c: Integer): Integer; cdecl; external 'c' name 'isxdigit';
+function c_isalnum_(c: Integer): Integer; cdecl; external 'c' name 'isalnum';
+function c_tolower_(c: Integer): Integer; cdecl; external 'c' name 'tolower';
+function c_toupper_(c: Integer): Integer; cdecl; external 'c' name 'toupper';
+
+procedure RefreshCType;
+var
+  c: Integer;
+  m: Word;
+begin
+  for c := 0 to 255 do
+  begin
+    m := 0;
+    if c_isalpha_(c) <> 0 then m := m or CT_ALPHA;
+    if (c >= 48) and (c <= 57) then m := m or CT_DIGIT;
+    if c_islower_(c) <> 0 then m := m or CT_LOWER;
+    if c_isupper_(c) <> 0 then m := m or CT_UPPER;
+    if c_isspace_(c) <> 0 then m := m or CT_SPACE;
+    if c_iscntrl_(c) <> 0 then m := m or CT_CNTRL;
+    if c_isgraph_(c) <> 0 then m := m or CT_GRAPH;
+    if c_ispunct_(c) <> 0 then m := m or CT_PUNCT;
+    if c_isxdigit_(c) <> 0 then m := m or CT_XDIGIT;
+    if c_isalnum_(c) <> 0 then m := m or CT_ALNUM;
+    CTypeTab[c] := m;
+    ToLowerTab[c] := Byte(c_tolower_(c));
+    ToUpperTab[c] := Byte(c_toupper_(c));
+  end;
+end;
+
+procedure BufInit(var b: TBuf);
+begin
+  b.P := nil;
+  b.Len := 0;
+  b.Cap := 0;
+end;
+
+procedure BufGrow(var b: TBuf; need: SizeInt);
+var
+  nc: SizeInt;
+begin
+  nc := b.Cap * 2;
+  if nc < 64 then nc := 64;
+  while nc < need do nc := nc * 2;
+  ReallocMem(b.P, nc);
+  b.Cap := nc;
+end;
+
+procedure BufAdd(var b: TBuf; p: PByte; n: SizeInt);
+begin
+  if n <= 0 then Exit;
+  if b.Len + n > b.Cap then BufGrow(b, b.Len + n);
+  Move(p^, b.P[b.Len], n);
+  Inc(b.Len, n);
+end;
+
+procedure BufAddByte(var b: TBuf; c: Byte);
+begin
+  if b.Len >= b.Cap then BufGrow(b, b.Len + 1);
+  b.P[b.Len] := c;
+  Inc(b.Len);
+end;
+
+procedure BufAddStr(var b: TBuf; const s: RawByteString);
+begin
+  BufAdd(b, PByte(Pointer(s)), Length(s));
+end;
+
+procedure BufFree(var b: TBuf);
+begin
+  if b.P <> nil then FreeMem(b.P);
+  b.P := nil;
+  b.Len := 0;
+  b.Cap := 0;
+end;
+
+procedure PushBuf(L: TLua; p: PByte; n: SizeUInt);
+var
+  o: TStringObj;
+begin
+  o := L.NewStringBuf(p, n);
+  if L.Top >= L.StackSize then L.EnsureStack(L.Top + 1);
+  L.Stack[L.Top].S := o;
+  L.Stack[L.Top].Vt := vtStr;
+  Inc(L.Top);
+end;
+
 procedure PushNil(L: TLua);
 begin
   LuaPush(L, LuaNil);
@@ -381,7 +497,7 @@ end;
 { conversions                                                            }
 { ===================================================================== }
 
-function PointerString(const v: TLuaValue): string;
+function PointerString(constref v: TLuaValue): string;
 var
   p: PtrUInt;
 begin
@@ -394,7 +510,7 @@ begin
   Result := '0x' + LowerCase(IntToHex(p, 14));
 end;
 
-function ToStringAux(L: TLua; const v: TLuaValue): RawByteString;
+function ToStringAux(L: TLua; constref v: TLuaValue): RawByteString;
 var
   tm, r, nm: TLuaValue;
 begin
@@ -426,7 +542,7 @@ end;
 { registration                                                           }
 { ===================================================================== }
 
-procedure SetField(L: TLua; t: TTable; const name: string; const v: TLuaValue);
+procedure SetField(L: TLua; t: TTable; const name: string; constref v: TLuaValue);
 begin
   TableSetStr(t, L.NewString(RawByteString(name)), v);
 end;
@@ -470,7 +586,7 @@ begin
     Result := v.T;
 end;
 
-procedure SetLoaded(L: TLua; const name: string; const v: TLuaValue);
+procedure SetLoaded(L: TLua; const name: string; constref v: TLuaValue);
 begin
   SetField(L, GetLoaded(L), name, v);
 end;
@@ -504,5 +620,8 @@ begin
   v := TableGetStr(L.Registry, StrKey(L, tname));
   if v.Vt = vtTab then Result := v.T else Result := nil;
 end;
+
+initialization
+  RefreshCType;
 
 end.

@@ -347,6 +347,7 @@ begin
   end;
   cat := CheckOption(L, 2, 'all', Cats);
   loc := c_setlocale(CatNum[cat], loc);
+  RefreshCType;
   if loc = nil then PushFail(L) else PushStr(L, RawByteString(StrPas(loc)));
   Result := 1;
 end;

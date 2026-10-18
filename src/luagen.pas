@@ -93,7 +93,7 @@ type
     // registers & constants
     function AllocReg: Integer;
     procedure ReserveTo(n: Integer);
-    function AddK(const v: TLuaValue): Integer;
+    function AddK(constref v: TLuaValue): Integer;
     function KStr(s: TStringObj): Integer;
     function KOf(e: TExpr): Integer;
     function IsConstExpr(e: TExpr): Boolean;
@@ -262,7 +262,7 @@ begin
   FreeReg := n;
 end;
 
-function TFuncGen.AddK(const v: TLuaValue): Integer;
+function TFuncGen.AddK(constref v: TLuaValue): Integer;
 
   function NewK: Integer;
   begin

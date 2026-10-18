@@ -42,6 +42,7 @@ type
   end;
   PLuaValue = ^TLuaValue;
 
+
   TGCObject = class
   public
     NextGC: TGCObject;
@@ -49,23 +50,29 @@ type
     Marked: Boolean;
     Fixed: Boolean;      // never collected
     FinState: Byte;      // 0: no finalizer; 1: registered for finalization
+    // collectable objects come from size-class free lists instead of the general heap
+    class function NewInstance: TObject; override;
+    procedure FreeInstance; override;
   end;
 
   // ---------------- strings ----------------
   TStringObj = class(TGCObject)
   public
-    Str: RawByteString;
+    Bytes: PByte;        // the characters (Len bytes plus a NUL), a pool block of its own
     Len: SizeUInt;
     Hash: Cardinal;
     IsShort: Boolean;    // interned
     HashDone: Boolean;
     HNext: TStringObj;   // chain in the string table
+    destructor Destroy; override;
+    function GetStr: RawByteString;
     function ToStr: RawByteString; inline;
     function Eq(const s2: TStringObj): Boolean;
     function EqRaw(const s2: RawByteString): Boolean;
     function GetHash: Cardinal; inline;
     function GetData: PByte; inline;
     property Data: PByte read GetData;
+    property Str: RawByteString read GetStr;   // a copy: prefer Data/Len in hot code
   end;
 
   // ---------------- userdata ----------------
@@ -87,25 +94,33 @@ type
     Next: Integer;       // next node in the collision chain, or -1
   end;
 
+  PTableNode = ^TTableNode;
+
+  // The parts of a table are plain memory blocks (no reference counting, no
+  // exception frames when resized or freed).
   TTable = class(TGCObject)
   public
-    Arr: array of TLuaValue;       // array part: keys 1..Length(Arr)
-    Node: array of TTableNode;     // hash part (size is 0 or a power of 2)
+    Arr: PLuaValue;                // array part: keys 1..ASize
+    Node: PTableNode;              // hash part (NSize is 0 or a power of 2)
+    ASize: Integer;
+    NSize: Integer;
     LastFree: Integer;
     Metatable: TTable;
-    function ASize: Integer; inline;
+    destructor Destroy; override;
   end;
 
   // ---------------- upvalues ----------------
   TUpval = class(TGCObject)
   public
     V: TLuaValue;        // value when closed
+    P: PLuaValue;        // where the value is: a stack slot while open, @V once closed
     Th: TThread;         // owner while open
     Idx: Integer;        // stack index while open, -1 when closed
     NextOpen: TUpval;    // list of open upvalues of the thread
     function IsOpen: Boolean; inline;
     function Get: TLuaValue; inline;
-    procedure SetVal(const x: TLuaValue); inline;
+    function Ref: PLuaValue; inline;   // where the value lives (stack slot or own storage)
+    procedure SetVal(constref x: TLuaValue); inline;
   end;
 
   // ---------------- prototypes ----------------
@@ -161,6 +176,7 @@ type
   end;
 
   // ---------------- call info / thread ----------------
+  PCallInfo = ^TCallInfo;
   TCallInfo = record
     Func: TFunction;
     FuncIdx: Integer;     // stack slot of the function; results go there
@@ -172,6 +188,7 @@ type
     IsC: Boolean;
     IsTail: Boolean;
     Hooked: Boolean;      // a hook function is running on behalf of this frame
+    Fresh: Boolean;       // entered from native code (DoCall): its return leaves VMExecute
     InFinalizer: Boolean; // a __gc finalizer is running on top of this frame
     FTransfer: Integer;   // values transferred by a call/return event (valid inside the hook)
     NTransfer: Integer;
@@ -181,9 +198,11 @@ type
   TThread = class(TGCObject)
   public
     Main: TLua;
-    Stack: array of TLuaValue;
+    Stack: PLuaValue;       // value stack (a plain memory block, zero filled = nil)
+    StackSize: Integer;
     Top: Integer;
-    CI: array of TCallInfo;
+    CI: PCallInfo;          // call infos: allocated once at the maximum depth, never moved
+    CISize: Integer;
     NCI: Integer;
     OpenUpvals: TUpval;     // open upvalues, ordered by decreasing Idx
     TbcList: array of Integer;
@@ -200,13 +219,14 @@ type
     HookCounter: Integer;
     InHook: Boolean;
     OldLine: Integer;
+    destructor Destroy; override;
     procedure EnsureStack(n: Integer);
-    function PushValue(const v: TLuaValue): Integer;
+    function PushValue(constref v: TLuaValue): Integer;
     procedure SetTop(idx: Integer);
   end;
 
   // ---------------- global state / main thread ----------------
-  TFinalizerProc = procedure(L: TLua; const obj: TLuaValue);
+  TFinalizerProc = procedure(L: TLua; constref obj: TLuaValue);
   TFreeThreadProc = procedure(th: TThread);
   TWarnProc = procedure(L: TLua; const msg: RawByteString; tocont: Boolean);
 
@@ -247,6 +267,7 @@ type
     constructor CreateThread(AMain: TLua);
     procedure RegisterObject(o: TGCObject; size: SizeUInt);
     function NewString(const s: RawByteString): TStringObj;
+    function NewStringBuf(p: PByte; n: SizeUInt): TStringObj;   // from raw bytes, no temporaries
     function NewTable(nArr, nRec: Integer): TTable;
     function NewUserdata(len: SizeUInt): TUserdata;
     function NewProto: TProto;
@@ -278,12 +299,16 @@ type
     ErrValue: TLuaValue;
     HasValue: Boolean;
     constructor CreateMsg(const m: string);
-    constructor CreateValue(const v: TLuaValue);
+    constructor CreateValue(constref v: TLuaValue);
   end;
 
 const
   LUA_MAXSHORTLEN = 40;
   MAXSTACK = 1000000;
+  // Call-info arrays are allocated once at their maximum size (call depth limit plus
+  // room for hooks/handlers); untouched pages cost nothing.
+  CI_CAPACITY_MAIN = 190000 + 512;
+  CI_CAPACITY_CO = 12000 + 512;
   LUA_MININTEGER = Low(Int64);
   LUA_MAXINTEGER = High(Int64);
 
@@ -371,6 +396,16 @@ const
 
 // ---------------- value helpers ----------------
 function LuaNil: TLuaValue; inline;
+// In-place writers/copiers. A TLuaValue is moved as a tag and a payload word:
+// a 16-byte block move right after narrower stores defeats store forwarding.
+procedure CopyVal(dst, src: PLuaValue); inline;
+procedure SetNilV(p: PLuaValue); inline;
+procedure SetBoolV(p: PLuaValue; b: Boolean); inline;
+procedure SetIntV(p: PLuaValue; i: Int64); inline;
+procedure SetFltV(p: PLuaValue; n: Double); inline;
+var
+  NilValue: TLuaValue;   // shared nil, returned by the pointer based lookups
+
 function LuaBool(b: Boolean): TLuaValue; inline;
 function LuaInt(i: Int64): TLuaValue; inline;
 function LuaNum(n: Double): TLuaValue; inline;
@@ -381,12 +416,12 @@ function LuaUser(u: TUserdata): TLuaValue; inline;
 function LuaThread(th: TThread): TLuaValue; inline;
 function LuaLight(p: Pointer): TLuaValue; inline;
 
-function IsNil(const v: TLuaValue): Boolean; inline;
-function IsFalse(const v: TLuaValue): Boolean; inline;
-function Truthy(const v: TLuaValue): Boolean; inline;
-function VTypeName(const v: TLuaValue): string;
-function RawEqual(const a, b: TLuaValue): Boolean;
-function NumToStr(const v: TLuaValue): string;
+function IsNil(constref v: TLuaValue): Boolean; inline;
+function IsFalse(constref v: TLuaValue): Boolean; inline;
+function Truthy(constref v: TLuaValue): Boolean; inline;
+function VTypeName(constref v: TLuaValue): string;
+function RawEqual(constref a, b: TLuaValue): Boolean;
+function NumToStr(constref v: TLuaValue): string;
 function FltToStrVal(n: Double): string;
 function CFormatDouble(const fmt: string; n: Double): string;
 function HexDigitVal(c: Char): Integer;
@@ -394,8 +429,8 @@ function ChunkIdStr(const source: string): string;
 function StrToIntVal(const s: RawByteString; var i: Int64): Boolean;
 function StrToNumVal(const s: RawByteString; var n: Double): Boolean;
 function LocaleDecPoint: Char;   // decimal point of the current C locale
-function ToInteger(const v: TLuaValue; var i: Int64): Boolean;
-function ToNumberVal(const v: TLuaValue; var n: Double): Boolean;
+function ToInteger(constref v: TLuaValue; var i: Int64): Boolean;
+function ToNumberVal(constref v: TLuaValue; var n: Double): Boolean;
 function FloatToInt(n: Double; var i: Int64; mode: Integer): Boolean;
 function HashString(const s: RawByteString): Cardinal;
 function StaticStr(const s: string): TStringObj;
@@ -404,11 +439,16 @@ function TMName(tm: Integer): TStringObj;
 // ---------------- tables ----------------
 function TableGetStr(t: TTable; ks: TStringObj): TLuaValue;
 function TableGetInt(t: TTable; ik: Int64): TLuaValue;
-function TableGet(t: TTable; const key: TLuaValue): TLuaValue;
-procedure TableSet(t: TTable; const key, val: TLuaValue);
-procedure TableSetInt(t: TTable; key: Int64; const val: TLuaValue);
-procedure TableSetStr(t: TTable; key: TStringObj; const val: TLuaValue);
-function TableNext(t: TTable; const key: TLuaValue; var nk, nv: TLuaValue): Boolean;
+function TableGet(t: TTable; constref key: TLuaValue): TLuaValue;
+// the same lookups returning a pointer to the value (to NilValue when absent);
+// the pointer is only valid until the table is modified
+function TableGetStrP(t: TTable; ks: TStringObj): PLuaValue;
+function TableGetIntP(t: TTable; ik: Int64): PLuaValue;
+function TableGetP(t: TTable; constref key: TLuaValue): PLuaValue;
+procedure TableSet(t: TTable; constref key, val: TLuaValue);
+procedure TableSetInt(t: TTable; key: Int64; constref val: TLuaValue);
+procedure TableSetStr(t: TTable; key: TStringObj; constref val: TLuaValue);
+function TableNext(t: TTable; constref key: TLuaValue; var nk, nv: TLuaValue): Boolean;
 function TableLength(t: TTable): Int64;
 function TableCount(t: TTable): Integer;
 procedure TableResize(t: TTable; nArr, nHash: Integer);
@@ -423,17 +463,121 @@ var
   TMNames: array[0..TM_N - 1] of TStringObj;
 
 { ===================================================================== }
+{ object pools                                                           }
+{ ===================================================================== }
+
+const
+  POOL_CLASSES = 17;           // instance sizes up to 256 bytes, in steps of 16
+  POOL_CHUNK = 256 * 1024;
+
+var
+  PoolFree: array[0..POOL_CLASSES - 1] of Pointer;
+  PoolChunk: PByte = nil;
+  PoolLeft: SizeInt = 0;
+
+class function TGCObject.NewInstance: TObject;
+var
+  cls, sz: SizeInt;
+  p: Pointer;
+begin
+  cls := (InstanceSize + 15) shr 4;
+  if cls >= POOL_CLASSES then
+    Exit(inherited NewInstance);
+  p := PoolFree[cls];
+  if p <> nil then
+    PoolFree[cls] := PPointer(p)^
+  else
+  begin
+    sz := cls shl 4;
+    if PoolLeft < sz then
+    begin
+      PoolChunk := GetMem(POOL_CHUNK);
+      PoolLeft := POOL_CHUNK;
+    end;
+    p := PoolChunk;
+    Inc(PoolChunk, sz);
+    Dec(PoolLeft, sz);
+  end;
+  Result := InitInstance(p);
+end;
+
+procedure TGCObject.FreeInstance;
+var
+  cls: SizeInt;
+begin
+  cls := (InstanceSize + 15) shr 4;
+  if cls >= POOL_CLASSES then
+  begin
+    inherited FreeInstance;
+    Exit;
+  end;
+  CleanupInstance;
+  PPointer(Pointer(Self))^ := PoolFree[cls];
+  PoolFree[cls] := Pointer(Self);
+end;
+
+// plain memory blocks for string characters, from the same size-class lists
+function BlockAlloc(n: SizeUInt): Pointer;
+var
+  cls, sz: SizeInt;
+begin
+  cls := (n + 15) shr 4;
+  if cls >= POOL_CLASSES then
+    Exit(GetMem(n));
+  Result := PoolFree[cls];
+  if Result <> nil then
+  begin
+    PoolFree[cls] := PPointer(Result)^;
+    Exit;
+  end;
+  sz := cls shl 4;
+  if PoolLeft < sz then
+  begin
+    PoolChunk := GetMem(POOL_CHUNK);
+    PoolLeft := POOL_CHUNK;
+  end;
+  Result := PoolChunk;
+  Inc(PoolChunk, sz);
+  Dec(PoolLeft, sz);
+end;
+
+procedure BlockFree(p: Pointer; n: SizeUInt);
+var
+  cls: SizeInt;
+begin
+  cls := (n + 15) shr 4;
+  if cls >= POOL_CLASSES then
+  begin
+    FreeMem(p);
+    Exit;
+  end;
+  PPointer(p)^ := PoolFree[cls];
+  PoolFree[cls] := p;
+end;
+
+{ ===================================================================== }
 { strings                                                                }
 { ===================================================================== }
 
+function TStringObj.GetStr: RawByteString;
+begin
+  SetString(Result, PAnsiChar(Bytes), Len);
+end;
+
 function TStringObj.ToStr: RawByteString;
 begin
-  Result := Str;
+  Result := GetStr;
+end;
+
+destructor TStringObj.Destroy;
+begin
+  if Bytes <> nil then BlockFree(Bytes, Len + 1);
+  inherited Destroy;
 end;
 
 function TStringObj.GetData: PByte;
 begin
-  Result := PByte(Pointer(Str));
+  Result := Bytes;
 end;
 
 function ComputeHash(const s: RawByteString): Cardinal;
@@ -447,6 +591,17 @@ begin
   Result := h;
 end;
 
+function HashBytes(p: PByte; n: SizeUInt): Cardinal;
+var
+  i: SizeInt;
+  h: Cardinal;
+begin
+  h := Cardinal($5bd1e995) xor Cardinal(n);
+  for i := SizeInt(n) - 1 downto 0 do
+    h := h xor ((h shl 5) + (h shr 2) + Cardinal(p[i]));
+  Result := h;
+end;
+
 function HashString(const s: RawByteString): Cardinal;
 begin
   Result := ComputeHash(s);
@@ -456,7 +611,7 @@ function TStringObj.GetHash: Cardinal;
 begin
   if not HashDone then
   begin
-    Hash := ComputeHash(Str);
+    Hash := HashBytes(Bytes, Len);
     HashDone := True;
   end;
   Result := Hash;
@@ -468,14 +623,14 @@ begin
   if IsShort and s2.IsShort then Exit(False);
   if Len <> s2.Len then Exit(False);
   if Len = 0 then Exit(True);
-  Result := CompareMem(Pointer(Str), Pointer(s2.Str), Len);
+  Result := CompareMem(Bytes, s2.Bytes, Len);
 end;
 
 function TStringObj.EqRaw(const s2: RawByteString): Boolean;
 begin
   if Len <> SizeUInt(Length(s2)) then Exit(False);
   if Len = 0 then Exit(True);
-  Result := CompareMem(Pointer(Str), Pointer(s2), Len);
+  Result := CompareMem(Bytes, Pointer(s2), Len);
 end;
 
 procedure StrTabResize(newSize: Integer);
@@ -500,18 +655,30 @@ begin
   StrTab := nt;
 end;
 
+// a string object whose characters are copied from p
+function MakeString(p: PByte; n: SizeUInt): TStringObj;
+begin
+  Result := TStringObj.Create;
+  Result.ObjType := OBJ_STR;
+  Result.Len := n;
+  Result.Bytes := BlockAlloc(n + 1);
+  if n > 0 then Move(p^, Result.Bytes^, n);
+  Result.Bytes[n] := 0;
+end;
+
 // finds or creates the interned short string; 'fresh' tells if it is new
-function InternShort(const s: RawByteString; var fresh: Boolean): TStringObj;
+function InternShort(p: PByte; n: SizeUInt; var fresh: Boolean): TStringObj;
 var
   h: Cardinal;
   idx: Integer;
 begin
-  h := ComputeHash(s);
+  h := HashBytes(p, n);
   idx := Integer(h and Cardinal(Length(StrTab) - 1));
   Result := StrTab[idx];
   while Result <> nil do
   begin
-    if (Result.Hash = h) and Result.EqRaw(s) then
+    if (Result.Hash = h) and (Result.Len = n) and
+       ((n = 0) or (CompareByte(Result.Bytes^, p^, n) = 0)) then
     begin
       fresh := False;
       Exit;
@@ -523,10 +690,7 @@ begin
     StrTabResize(Length(StrTab) * 2);
     idx := Integer(h and Cardinal(Length(StrTab) - 1));
   end;
-  Result := TStringObj.Create;
-  Result.ObjType := OBJ_STR;
-  Result.Str := s;
-  Result.Len := Length(s);
+  Result := MakeString(p, n);
   Result.Hash := h;
   Result.HashDone := True;
   Result.IsShort := True;
@@ -544,15 +708,12 @@ begin
     SetLength(StrTab, 1024);
   if Length(s) <= LUA_MAXSHORTLEN then
   begin
-    Result := InternShort(RawByteString(s), fresh);
+    Result := InternShort(PByte(Pointer(s)), Length(s), fresh);
     Result.Fixed := True;
   end
   else
   begin
-    Result := TStringObj.Create;
-    Result.ObjType := OBJ_STR;
-    Result.Str := RawByteString(s);
-    Result.Len := Length(s);
+    Result := MakeString(PByte(Pointer(s)), Length(s));
     Result.Fixed := True;
   end;
 end;
@@ -569,6 +730,35 @@ end;
 function LuaNil: TLuaValue;
 begin
   Result.Vt := vtNil;
+end;
+
+procedure CopyVal(dst, src: PLuaValue);
+begin
+  dst^.Vt := src^.Vt;
+  dst^.I := src^.I;
+end;
+
+procedure SetNilV(p: PLuaValue);
+begin
+  p^.Vt := vtNil;
+end;
+
+procedure SetBoolV(p: PLuaValue; b: Boolean);
+begin
+  p^.Vt := vtBool;
+  p^.I := Ord(b);
+end;
+
+procedure SetIntV(p: PLuaValue; i: Int64);
+begin
+  p^.Vt := vtInt;
+  p^.I := i;
+end;
+
+procedure SetFltV(p: PLuaValue; n: Double);
+begin
+  p^.Vt := vtFlt;
+  p^.N := n;
 end;
 
 function LuaBool(b: Boolean): TLuaValue;
@@ -625,22 +815,22 @@ begin
   Result.P := p;
 end;
 
-function IsNil(const v: TLuaValue): Boolean;
+function IsNil(constref v: TLuaValue): Boolean;
 begin
   Result := v.Vt = vtNil;
 end;
 
-function IsFalse(const v: TLuaValue): Boolean;
+function IsFalse(constref v: TLuaValue): Boolean;
 begin
   Result := (v.Vt = vtNil) or ((v.Vt = vtBool) and not v.B);
 end;
 
-function Truthy(const v: TLuaValue): Boolean;
+function Truthy(constref v: TLuaValue): Boolean;
 begin
   Result := not ((v.Vt = vtNil) or ((v.Vt = vtBool) and not v.B));
 end;
 
-function VTypeName(const v: TLuaValue): string;
+function VTypeName(constref v: TLuaValue): string;
 begin
   case v.Vt of
     vtNil, vtDead: Result := 'nil';
@@ -677,7 +867,7 @@ begin
   Result := True;
 end;
 
-function RawEqual(const a, b: TLuaValue): Boolean;
+function RawEqual(constref a, b: TLuaValue): Boolean;
 var
   i: Int64;
 begin
@@ -759,7 +949,7 @@ begin
   Result := s;
 end;
 
-function NumToStr(const v: TLuaValue): string;
+function NumToStr(constref v: TLuaValue): string;
 begin
   if v.Vt = vtInt then
     Result := IntToStr(v.I)
@@ -991,7 +1181,7 @@ begin
   Result := True;
 end;
 
-function ToInteger(const v: TLuaValue; var i: Int64): Boolean;
+function ToInteger(constref v: TLuaValue; var i: Int64): Boolean;
 var
   n: Double;
 begin
@@ -1006,7 +1196,7 @@ begin
   Result := False;
 end;
 
-function ToNumberVal(const v: TLuaValue; var n: Double): Boolean;
+function ToNumberVal(constref v: TLuaValue; var n: Double): Boolean;
 var
   i: Int64;
 begin
@@ -1034,9 +1224,11 @@ begin
   inherited Destroy;
 end;
 
-function TTable.ASize: Integer;
+destructor TTable.Destroy;
 begin
-  Result := Length(Arr);
+  if Arr <> nil then FreeMem(Arr);
+  if Node <> nil then FreeMem(Node);
+  inherited Destroy;
 end;
 
 function TUpval.IsOpen: Boolean;
@@ -1046,33 +1238,55 @@ end;
 
 function TUpval.Get: TLuaValue;
 begin
-  if Idx >= 0 then Result := Th.Stack[Idx] else Result := V;
+  CopyVal(@Result, P);
 end;
 
-procedure TUpval.SetVal(const x: TLuaValue);
+function TUpval.Ref: PLuaValue;
 begin
-  if Idx >= 0 then Th.Stack[Idx] := x else V := x;
+  Result := P;
+end;
+
+procedure TUpval.SetVal(constref x: TLuaValue);
+begin
+  CopyVal(P, @x);
+end;
+
+destructor TThread.Destroy;
+begin
+  if Stack <> nil then FreeMem(Stack);
+  if CI <> nil then FreeMem(CI);
+  inherited Destroy;
 end;
 
 procedure TThread.EnsureStack(n: Integer);
 var
   ns: Integer;
+  u: TUpval;
 begin
-  if n <= Length(Stack) then
+  if n <= StackSize then
     Exit;
   if n > MAXSTACK + 1000 then
     raise ELuaError.CreateMsg('stack overflow');
-  ns := Length(Stack) * 2;
+  ns := StackSize * 2;
   while ns < n do
     ns := ns * 2;
   if ns > MAXSTACK + 1000 then
     ns := MAXSTACK + 1000;
   if Main <> nil then
-    Main.Account(Int64(ns - Length(Stack)) * SizeOf(TLuaValue));
-  SetLength(Stack, ns);
+    Main.Account(Int64(ns - StackSize) * SizeOf(TLuaValue));
+  ReallocMem(Stack, ns * SizeOf(TLuaValue));
+  FillChar(Stack[StackSize], (ns - StackSize) * SizeOf(TLuaValue), 0);   // new slots are nil
+  StackSize := ns;
+  // the block may have moved: open upvalues point into it
+  u := OpenUpvals;
+  while u <> nil do
+  begin
+    u.P := @Stack[u.Idx];
+    u := u.NextOpen;
+  end;
 end;
 
-function TThread.PushValue(const v: TLuaValue): Integer;
+function TThread.PushValue(constref v: TLuaValue): Integer;
 begin
   EnsureStack(Top + 1);
   Stack[Top] := v;
@@ -1100,7 +1314,7 @@ begin
   HasValue := False;
 end;
 
-constructor ELuaError.CreateValue(const v: TLuaValue);
+constructor ELuaError.CreateValue(constref v: TLuaValue);
 begin
   if v.Vt = vtStr then
     inherited Create(string(v.S.Str))
@@ -1125,7 +1339,7 @@ begin
   Result := Cardinal(h shr 32);
 end;
 
-function KeyHash(const key: TLuaValue): Cardinal;
+function KeyHash(constref key: TLuaValue): Cardinal;
 var
   bits: Int64;
 begin
@@ -1145,12 +1359,12 @@ begin
   end;
 end;
 
-function MainPos(t: TTable; const key: TLuaValue): Integer; inline;
+function MainPos(t: TTable; constref key: TLuaValue): Integer; inline;
 begin
-  Result := Integer(KeyHash(key) and Cardinal(Length(t.Node) - 1));
+  Result := Integer(KeyHash(key) and Cardinal(t.NSize - 1));
 end;
 
-function KeyEquals(const nk, key: TLuaValue): Boolean; inline;
+function KeyEquals(constref nk, key: TLuaValue): Boolean; inline;
 begin
   if nk.Vt <> key.Vt then Exit(False);
   case key.Vt of
@@ -1165,11 +1379,11 @@ begin
 end;
 
 // index of the node holding 'key', or -1
-function FindNode(t: TTable; const key: TLuaValue): Integer;
+function FindNode(t: TTable; constref key: TLuaValue): Integer;
 var
   i: Integer;
 begin
-  if Length(t.Node) = 0 then Exit(-1);
+  if t.NSize = 0 then Exit(-1);
   i := MainPos(t, key);
   while i >= 0 do
   begin
@@ -1181,13 +1395,13 @@ end;
 
 // like FindNode, but also finds entries whose key was cleared by the
 // collector (the key of a traversal may have been removed meanwhile)
-function FindNodeForNext(t: TTable; const key: TLuaValue): Integer;
+function FindNodeForNext(t: TTable; constref key: TLuaValue): Integer;
 var
   i: Integer;
   dk: TLuaValue;
 begin
   Result := FindNode(t, key);
-  if (Result >= 0) or (Length(t.Node) = 0) then Exit;
+  if (Result >= 0) or (t.NSize = 0) then Exit;
   if key.Vt in [vtStr, vtTab, vtFunc, vtUser, vtThread] then
   begin
     i := MainPos(t, key);
@@ -1200,66 +1414,86 @@ begin
   end;
 end;
 
-function TableGetStr(t: TTable; ks: TStringObj): TLuaValue;
+function TableGetStrP(t: TTable; ks: TStringObj): PLuaValue;
+var
+  i: Integer;
+  nodes: ^TTableNode;
+begin
+  if t.NSize > 0 then
+  begin
+    nodes := @t.Node[0];
+    i := Integer(ks.GetHash and Cardinal(t.NSize - 1));
+    if ks.IsShort then
+      repeat
+        with nodes[i] do
+          if (Key.Vt = vtStr) and (Key.S = ks) then Exit(@Val);
+        i := nodes[i].Next;
+      until i < 0
+    else
+      repeat
+        with nodes[i] do
+          if (Key.Vt = vtStr) and ((Key.S = ks) or Key.S.Eq(ks)) then Exit(@Val);
+        i := nodes[i].Next;
+      until i < 0;
+  end;
+  Result := @NilValue;
+end;
+
+function TableGetIntP(t: TTable; ik: Int64): PLuaValue;
 var
   i: Integer;
 begin
-  if Length(t.Node) > 0 then
+  if QWord(ik - 1) < QWord(t.ASize) then
+    Exit(@t.Arr[ik - 1]);
+  if t.NSize > 0 then
   begin
-    i := Integer(ks.GetHash and Cardinal(Length(t.Node) - 1));
-    while i >= 0 do
-    begin
+    i := Integer(HashInt(ik) and Cardinal(t.NSize - 1));
+    repeat
       with t.Node[i] do
-        if (Key.Vt = vtStr) and ((Key.S = ks) or ((not ks.IsShort) and Key.S.Eq(ks))) then
-          Exit(Val);
+        if (Key.Vt = vtInt) and (Key.I = ik) then Exit(@Val);
       i := t.Node[i].Next;
-    end;
+    until i < 0;
   end;
-  Result.Vt := vtNil;
+  Result := @NilValue;
 end;
 
-function TableGetInt(t: TTable; ik: Int64): TLuaValue;
-var
-  i: Integer;
-begin
-  if QWord(ik - 1) < QWord(Length(t.Arr)) then
-    Exit(t.Arr[ik - 1]);
-  if Length(t.Node) > 0 then
-  begin
-    i := Integer(HashInt(ik) and Cardinal(Length(t.Node) - 1));
-    while i >= 0 do
-    begin
-      with t.Node[i] do
-        if (Key.Vt = vtInt) and (Key.I = ik) then
-          Exit(Val);
-      i := t.Node[i].Next;
-    end;
-  end;
-  Result.Vt := vtNil;
-end;
-
-function TableGet(t: TTable; const key: TLuaValue): TLuaValue;
+function TableGetP(t: TTable; constref key: TLuaValue): PLuaValue;
 var
   i: Integer;
   k: Int64;
 begin
   case key.Vt of
-    vtNil: Result.Vt := vtNil;
-    vtInt: Result := TableGetInt(t, key.I);
-    vtStr: Result := TableGetStr(t, key.S);
+    vtNil: Result := @NilValue;
+    vtInt: Result := TableGetIntP(t, key.I);
+    vtStr: Result := TableGetStrP(t, key.S);
     vtFlt: begin
       if FloatToInt(key.N, k, F2I_EQ) then
-        Result := TableGetInt(t, k)
+        Result := TableGetIntP(t, k)
       else
       begin
         i := FindNode(t, key);
-        if i < 0 then Result.Vt := vtNil else Result := t.Node[i].Val;
+        if i < 0 then Result := @NilValue else Result := @t.Node[i].Val;
       end;
     end;
   else
     i := FindNode(t, key);
-    if i < 0 then Result.Vt := vtNil else Result := t.Node[i].Val;
+    if i < 0 then Result := @NilValue else Result := @t.Node[i].Val;
   end;
+end;
+
+function TableGetStr(t: TTable; ks: TStringObj): TLuaValue;
+begin
+  Result := TableGetStrP(t, ks)^;
+end;
+
+function TableGetInt(t: TTable; ik: Int64): TLuaValue;
+begin
+  Result := TableGetIntP(t, ik)^;
+end;
+
+function TableGet(t: TTable; constref key: TLuaValue): TLuaValue;
+begin
+  Result := TableGetP(t, key)^;
 end;
 
 procedure NodeInit(var n: TTableNode); inline;
@@ -1271,7 +1505,7 @@ end;
 
 function TableAccountSize(t: TTable): Int64; inline;
 begin
-  Result := Int64(Length(t.Arr)) * SizeOf(TLuaValue) + Int64(Length(t.Node)) * SizeOf(TTableNode);
+  Result := Int64(t.ASize) * SizeOf(TLuaValue) + Int64(t.NSize) * SizeOf(TTableNode);
 end;
 
 // counts the integer keys of the array part, per power-of-2 slice
@@ -1287,9 +1521,9 @@ begin
   begin
     lc := 0;
     lim := ttlg;
-    if lim > Length(t.Arr) then
+    if lim > t.ASize then
     begin
-      lim := Length(t.Arr);
+      lim := t.ASize;
       if i > lim then Break;
     end;
     while i <= lim do
@@ -1346,64 +1580,82 @@ begin
   Result := optimal;
 end;
 
-procedure InsertRaw(t: TTable; const key, val: TLuaValue); forward;
+procedure InsertRaw(t: TTable; constref key, val: TLuaValue); forward;
 
 procedure TableResize(t: TTable; nArr, nHash: Integer);
 var
-  oldArr: array of TLuaValue;
-  oldNode: array of TTableNode;
-  i, lsize, sz: Integer;
+  oldArr: PLuaValue;
+  oldNode: PTableNode;
+  oldASize, oldNSize, i, lsize, sz: Integer;
   before: Int64;
 begin
   before := TableAccountSize(t);
   oldArr := t.Arr;
   oldNode := t.Node;
+  oldASize := t.ASize;
+  oldNSize := t.NSize;
   // new hash part
   t.Node := nil;
+  t.NSize := 0;
   if nHash > 0 then
   begin
     lsize := CeilLog2(Cardinal(nHash));
     sz := 1 shl lsize;
-    SetLength(t.Node, sz);
+    t.Node := GetMem(sz * SizeOf(TTableNode));
+    t.NSize := sz;
     for i := 0 to sz - 1 do NodeInit(t.Node[i]);
   end;
-  t.LastFree := Length(t.Node);
+  t.LastFree := t.NSize;
   // new array part
   t.Arr := nil;
-  SetLength(t.Arr, nArr);
-  for i := 0 to nArr - 1 do t.Arr[i].Vt := vtNil;
+  t.ASize := nArr;
+  if nArr > 0 then
+  begin
+    t.Arr := GetMem(nArr * SizeOf(TLuaValue));
+    for i := 0 to nArr - 1 do t.Arr[i].Vt := vtNil;
+  end;
   // re-insert elements from the old array part
-  for i := 0 to Length(oldArr) - 1 do
+  for i := 0 to oldASize - 1 do
     if oldArr[i].Vt <> vtNil then
       InsertRaw(t, LuaInt(i + 1), oldArr[i]);
   // re-insert elements from the old hash part
-  for i := Length(oldNode) - 1 downto 0 do
+  for i := oldNSize - 1 downto 0 do
     if oldNode[i].Val.Vt <> vtNil then
       InsertRaw(t, oldNode[i].Key, oldNode[i].Val);
+  if oldArr <> nil then FreeMem(oldArr);
+  if oldNode <> nil then FreeMem(oldNode);
   if TheState <> nil then
     TheState.Account(TableAccountSize(t) - before);
 end;
 
-procedure TableRehash(t: TTable; const extraKey: TLuaValue);
+procedure TableRehash(t: TTable; constref extraKey: TLuaValue);
 var
   nums: array[0..MAXABITS + 1] of Integer;
-  i, na, totaluse, asize: Integer;
+  i, na, totaluse, asize, nsize: Integer;
+  deleted: Boolean;
 begin
   for i := 0 to MAXABITS + 1 do nums[i] := 0;
   na := NumUseArray(t, nums);
   totaluse := na;
-  for i := 0 to Length(t.Node) - 1 do
+  deleted := False;
+  for i := 0 to t.NSize - 1 do
     if t.Node[i].Val.Vt <> vtNil then
     begin
       if t.Node[i].Key.Vt = vtInt then
         Inc(na, CountInt(t.Node[i].Key.I, nums));
       Inc(totaluse);
-    end;
+    end
+    else
+      deleted := True;   // a removed entry (the table is full when it is rehashed)
   if extraKey.Vt = vtInt then
     Inc(na, CountInt(extraKey.I, nums));
   Inc(totaluse);
   asize := ComputeSizes(nums, na);
-  TableResize(t, asize, totaluse - na);
+  nsize := totaluse - na;
+  // insertion-deletion-insertion: give the hash part some extra room to avoid
+  // rehashing again at once
+  if deleted then Inc(nsize, nsize shr 2);
+  TableResize(t, asize, nsize);
 end;
 
 function GetFreePos(t: TTable): Integer;
@@ -1418,11 +1670,11 @@ begin
 end;
 
 // inserts a key known to be absent; may rehash
-procedure NewKey(t: TTable; const key, val: TLuaValue);
+procedure NewKey(t: TTable; constref key, val: TLuaValue);
 var
   mp, f, othern: Integer;
 begin
-  if Length(t.Node) = 0 then
+  if t.NSize = 0 then
   begin
     TableRehash(t, key);
     InsertRaw(t, key, val);
@@ -1462,13 +1714,13 @@ begin
 end;
 
 // sets a key of the table (key normalized and not nil/NaN)
-procedure InsertRaw(t: TTable; const key, val: TLuaValue);
+procedure InsertRaw(t: TTable; constref key, val: TLuaValue);
 var
   i: Integer;
 begin
   if key.Vt = vtInt then
   begin
-    if QWord(key.I - 1) < QWord(Length(t.Arr)) then
+    if QWord(key.I - 1) < QWord(t.ASize) then
     begin
       t.Arr[key.I - 1] := val;
       Exit;
@@ -1481,7 +1733,7 @@ begin
     NewKey(t, key, val);
 end;
 
-procedure TableSet(t: TTable; const key, val: TLuaValue);
+procedure TableSet(t: TTable; constref key, val: TLuaValue);
 var
   k: Int64;
   nk: TLuaValue;
@@ -1502,15 +1754,15 @@ begin
   InsertRaw(t, nk, val);
 end;
 
-procedure TableSetInt(t: TTable; key: Int64; const val: TLuaValue);
+procedure TableSetInt(t: TTable; key: Int64; constref val: TLuaValue);
 begin
-  if QWord(key - 1) < QWord(Length(t.Arr)) then
+  if QWord(key - 1) < QWord(t.ASize) then
     t.Arr[key - 1] := val
   else
     InsertRaw(t, LuaInt(key), val);
 end;
 
-procedure TableSetStr(t: TTable; key: TStringObj; const val: TLuaValue);
+procedure TableSetStr(t: TTable; key: TStringObj; constref val: TLuaValue);
 begin
   InsertRaw(t, LuaStr(key), val);
 end;
@@ -1521,7 +1773,7 @@ begin
 end;
 
 // iteration order: array part, then hash nodes by index
-function TableNext(t: TTable; const key: TLuaValue; var nk, nv: TLuaValue): Boolean;
+function TableNext(t: TTable; constref key: TLuaValue; var nk, nv: TLuaValue): Boolean;
 var
   i, n: Integer;
   k: Int64;
@@ -1534,17 +1786,17 @@ begin
     fk := key;
     if (fk.Vt = vtFlt) and FloatToInt(fk.N, k, F2I_EQ) then
       fk := LuaInt(k);
-    if (fk.Vt = vtInt) and (QWord(fk.I - 1) < QWord(Length(t.Arr))) then
+    if (fk.Vt = vtInt) and (QWord(fk.I - 1) < QWord(t.ASize)) then
       i := Integer(fk.I)
     else
     begin
       n := FindNodeForNext(t, fk);
       if n < 0 then
         raise ELuaError.CreateMsg('invalid key to ''next''');
-      i := Length(t.Arr) + n + 1;
+      i := t.ASize + n + 1;
     end;
   end;
-  while i < Length(t.Arr) do
+  while i < t.ASize do
   begin
     if t.Arr[i].Vt <> vtNil then
     begin
@@ -1554,8 +1806,8 @@ begin
     end;
     Inc(i);
   end;
-  Dec(i, Length(t.Arr));
-  while i < Length(t.Node) do
+  Dec(i, t.ASize);
+  while i < t.NSize do
   begin
     if t.Node[i].Val.Vt <> vtNil then
     begin
@@ -1573,7 +1825,7 @@ function TableLength(t: TTable): Int64;
 var
   i, j, m: Int64;
 begin
-  j := Length(t.Arr);
+  j := t.ASize;
   if (j > 0) and (t.Arr[j - 1].Vt = vtNil) then
   begin
     // there is a border in the array part: binary search
@@ -1585,7 +1837,7 @@ begin
     end;
     Exit(i);
   end;
-  if (Length(t.Node) = 0) or (TableGetInt(t, j + 1).Vt = vtNil) then
+  if (t.NSize = 0) or (TableGetInt(t, j + 1).Vt = vtNil) then
     Exit(j);
   // unbound search in the hash part
   i := j + 1;
@@ -1615,9 +1867,9 @@ var
   i: Integer;
 begin
   Result := 0;
-  for i := 0 to Length(t.Arr) - 1 do
+  for i := 0 to t.ASize - 1 do
     if t.Arr[i].Vt <> vtNil then Inc(Result);
-  for i := 0 to Length(t.Node) - 1 do
+  for i := 0 to t.NSize - 1 do
     if t.Node[i].Val.Vt <> vtNil then Inc(Result);
 end;
 
@@ -1656,14 +1908,16 @@ begin
   Main := Self;
   TheState := Self;
   CurThread := Self;
-  SetLength(Stack, 256);
-  SetLength(CI, 32);
+  StackSize := 256;
+  Stack := AllocMem(StackSize * SizeOf(TLuaValue));
+  CISize := CI_CAPACITY_MAIN;
+  CI := GetMem(CISize * SizeOf(TCallInfo));   // never reallocated: the VM keeps pointers into it
   GCMode := 'incremental';
   GCPause := 200;
   GCStepMul := 100;
   GCStepSize := 13;
   GCThreshold := 1024 * 1024;
-  TotalBytes := Length(Stack) * SizeOf(TLuaValue);
+  TotalBytes := StackSize * SizeOf(TLuaValue);
   if Length(StrTab) = 0 then
     SetLength(StrTab, 1024);
   for i := 0 to TM_N - 1 do
@@ -1679,8 +1933,10 @@ begin
   inherited Create;
   ObjType := OBJ_THREAD;
   Main := AMain;
-  SetLength(Stack, 64);
-  SetLength(CI, 8);
+  StackSize := 64;
+  Stack := AllocMem(StackSize * SizeOf(TLuaValue));
+  CISize := CI_CAPACITY_CO;
+  CI := GetMem(CISize * SizeOf(TCallInfo));
   AMain.RegisterObject(Self, 400 + 64 * SizeOf(TLuaValue));
 end;
 
@@ -1700,21 +1956,23 @@ begin
 end;
 
 function TLua.NewString(const s: RawByteString): TStringObj;
+begin
+  Result := NewStringBuf(PByte(Pointer(s)), Length(s));
+end;
+
+function TLua.NewStringBuf(p: PByte; n: SizeUInt): TStringObj;
 var
   fresh: Boolean;
 begin
-  if Length(s) <= LUA_MAXSHORTLEN then
+  if n <= LUA_MAXSHORTLEN then
   begin
-    Result := InternShort(s, fresh);
-    if fresh then Main.TotalBytes := Main.TotalBytes + 48 + Length(s);
+    Result := InternShort(p, n, fresh);
+    if fresh then Main.TotalBytes := Main.TotalBytes + 48 + n;
   end
   else
   begin
-    Result := TStringObj.Create;
-    Result.ObjType := OBJ_STR;
-    Result.Str := s;
-    Result.Len := Length(s);
-    RegisterObject(Result, 48 + SizeUInt(Length(s)));
+    Result := MakeString(p, n);
+    RegisterObject(Result, 48 + n);
   end;
 end;
 
@@ -1777,6 +2035,7 @@ begin
   Result := TUpval.Create;
   Result.ObjType := OBJ_UPVAL;
   Result.Idx := -1;
+  Result.P := @Result.V;
   Result.V.Vt := vtNil;
   RegisterObject(Result, 48);
 end;
@@ -1836,7 +2095,7 @@ begin
   end;
 end;
 
-procedure MarkVal(const v: TLuaValue); inline;
+procedure MarkVal(constref v: TLuaValue); inline;
 begin
   case v.Vt of
     vtStr, vtTab, vtFunc, vtUser, vtThread: MarkObj(TGCObject(v.T));
@@ -1845,7 +2104,7 @@ end;
 
 // has the collectable value been collected? (strings are values: they are
 // marked and never cleared)
-function IsCleared(const v: TLuaValue): Boolean;
+function IsCleared(constref v: TLuaValue): Boolean;
 var
   o: TGCObject;
 begin
@@ -1894,9 +2153,9 @@ begin
   MarkObj(t.Metatable);
   if not WeakMode(t, wk, wv) then
   begin
-    for i := 0 to Length(t.Arr) - 1 do
+    for i := 0 to t.ASize - 1 do
       MarkVal(t.Arr[i]);
-    for i := 0 to Length(t.Node) - 1 do
+    for i := 0 to t.NSize - 1 do
       with t.Node[i] do
         if Val.Vt = vtNil then
           KillDeadKey(t.Node[i])
@@ -1913,9 +2172,9 @@ begin
     if GW.NAW >= Length(GW.AllWeak) then SetLength(GW.AllWeak, GW.NAW * 2 + 16);
     GW.AllWeak[GW.NAW] := t;
     Inc(GW.NAW);
-    for i := 0 to Length(t.Arr) - 1 do
+    for i := 0 to t.ASize - 1 do
       if t.Arr[i].Vt = vtStr then t.Arr[i].S.Marked := True;
-    for i := 0 to Length(t.Node) - 1 do
+    for i := 0 to t.NSize - 1 do
       with t.Node[i] do
         if Val.Vt <> vtNil then
         begin
@@ -1929,9 +2188,9 @@ begin
     if GW.NWV >= Length(GW.WeakVals) then SetLength(GW.WeakVals, GW.NWV * 2 + 16);
     GW.WeakVals[GW.NWV] := t;
     Inc(GW.NWV);
-    for i := 0 to Length(t.Arr) - 1 do
+    for i := 0 to t.ASize - 1 do
       if t.Arr[i].Vt = vtStr then t.Arr[i].S.Marked := True;
-    for i := 0 to Length(t.Node) - 1 do
+    for i := 0 to t.NSize - 1 do
       with t.Node[i] do
         if Val.Vt = vtNil then
           KillDeadKey(t.Node[i])
@@ -1944,9 +2203,9 @@ begin
   else
   begin
     // weak keys (ephemeron): a value is marked only if its key is
-    for i := 0 to Length(t.Arr) - 1 do
+    for i := 0 to t.ASize - 1 do
       MarkVal(t.Arr[i]);
-    for i := 0 to Length(t.Node) - 1 do
+    for i := 0 to t.NSize - 1 do
       with t.Node[i] do
         if Val.Vt = vtNil then
           KillDeadKey(t.Node[i])
@@ -1972,11 +2231,11 @@ begin
   if th.GCLimit > 0 then lim := th.GCLimit
   else if (th.NCI > 0) and th.CI[th.NCI - 1].IsC and (th.Top >= th.CI[th.NCI - 1].Base) then
     lim := th.Top;   // inside a C function only its arguments and pushed values are live
-  if lim > Length(th.Stack) then lim := Length(th.Stack);
+  if lim > th.StackSize then lim := th.StackSize;
   for i := 0 to lim - 1 do
     MarkVal(th.Stack[i]);
   // the part of the stack above the frame is dead: clear it
-  for i := lim to Length(th.Stack) - 1 do
+  for i := lim to th.StackSize - 1 do
     th.Stack[i].Vt := vtNil;
   // open upvalues keep their value in the stack, but the objects must live
   u := th.OpenUpvals;
@@ -2056,7 +2315,7 @@ begin
     for k := 0 to GW.NEph - 1 do
     begin
       t := GW.Eph[k];
-      for i := 0 to Length(t.Node) - 1 do
+      for i := 0 to t.NSize - 1 do
         with t.Node[i] do
           if (Val.Vt <> vtNil) and (not IsCleared(Key)) then
             case Val.Vt of
@@ -2080,9 +2339,9 @@ begin
   for k := first to n - 1 do
   begin
     t := lst[k];
-    for i := 0 to Length(t.Arr) - 1 do
+    for i := 0 to t.ASize - 1 do
       if IsCleared(t.Arr[i]) then t.Arr[i].Vt := vtNil;
-    for i := 0 to Length(t.Node) - 1 do
+    for i := 0 to t.NSize - 1 do
       with t.Node[i] do
         if Val.Vt <> vtNil then
         begin
@@ -2100,7 +2359,7 @@ begin
   for k := 0 to n - 1 do
   begin
     t := lst[k];
-    for i := 0 to Length(t.Node) - 1 do
+    for i := 0 to t.NSize - 1 do
       with t.Node[i] do
         if Val.Vt <> vtNil then
         begin
@@ -2129,6 +2388,7 @@ begin
   end;
   uv.Th := nil;
   uv.Idx := -1;
+  uv.P := @uv.V;
 end;
 
 procedure CloseThreadUpvals(th: TThread);
@@ -2141,6 +2401,7 @@ begin
     nxt := u.NextOpen;
     u.V := th.Stack[u.Idx];
     u.Idx := -1;
+    u.P := @u.V;
     u.Th := nil;
     u.NextOpen := nil;
     u := nxt;
@@ -2166,7 +2427,7 @@ begin
       th := TThread(o);
       if L.FreeThreadProc <> nil then L.FreeThreadProc(th);
       CloseThreadUpvals(th);
-      sz := 400 + Int64(Length(th.Stack)) * SizeOf(TLuaValue);
+      sz := 400 + Int64(th.StackSize) * SizeOf(TLuaValue);
     end;
     OBJ_PROTO: sz := 160;
     OBJ_FUNC: sz := 64 + Int64(Length(TFunction(o).Upvals)) * 8

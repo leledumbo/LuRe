@@ -107,8 +107,8 @@ begin
   end;
   Strs.Add(s.Str, Strs.Count);
   WInt(1);
-  WInt(Length(s.Str));
-  Block(Pointer(s.Str)^, Length(s.Str));
+  WInt(s.Len);
+  Block(s.Bytes^, s.Len);
 end;
 
 procedure TDumper.Header;

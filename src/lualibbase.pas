@@ -17,7 +17,7 @@ function LoadBuffer(L: TLua; const buf: RawByteString; const name, mode: string;
                     var f: TFunction; var err: string): Boolean;
 function ReadFileContent(const fname: string; var content: RawByteString): Boolean;
 procedure PrepareFileChunk(var s: RawByteString);
-procedure SetEnvUpvalue(L: TLua; f: TFunction; const env: TLuaValue);
+procedure SetEnvUpvalue(L: TLua; f: TFunction; constref env: TLuaValue);
 procedure OutWrite(const s: RawByteString);
 procedure OutFlush;
 procedure WarnMessage(L: TLua; const msg: RawByteString; tocont: Boolean);
@@ -87,7 +87,7 @@ end;
 { loading                                                                }
 { ===================================================================== }
 
-procedure SetEnvUpvalue(L: TLua; f: TFunction; const env: TLuaValue);
+procedure SetEnvUpvalue(L: TLua; f: TFunction; constref env: TLuaValue);
 var
   i: Integer;
   u: TUpval;

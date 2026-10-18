@@ -7,6 +7,9 @@
 # built side by side without interfering with each other.
 
 FPC      ?= fpc
+# compiler optimization flags; override for a tuned build, e.g.
+#   make x86_64-linux FPCFLAGS='-O4 -CpZEN3 -OpZEN3 -CX -XX -Xs'
+# (the binary is rebuilt when the flags change)
 FPCFLAGS ?= -O2
 
 # <cpu>-<os> names understood by 'fpc -P<cpu> -T<os>'
@@ -21,7 +24,9 @@ SRC := $(wildcard src/*.pas)
 
 .DEFAULT_GOAL := help
 
-.PHONY: help clean clean-all $(TARGETS)
+.PHONY: help bench clean clean-all FORCE $(TARGETS)
+
+FORCE:
 
 help:
 	@echo "Usage: make <FPCTARGET>"
@@ -31,6 +36,7 @@ help:
 	  if [ "$$t" = "$(NATIVE)" ]; then echo "  $$t   (native)"; else echo "  $$t"; fi; \
 	done
 	@echo
+	@echo "  bench             time tools/bench/*.lua (native LuRe, and the reference if built)"
 	@echo "  clean-all         remove bin/ and units/"
 	@echo "  clean-<FPCTARGET> remove the output of one target"
 	@echo
@@ -41,8 +47,14 @@ help:
 define target_rule
 $(1): bin/$(1)/lua
 
-bin/$(1)/lua: $(SRC)
+# records the flags so that a change of FPCFLAGS triggers a rebuild
+units/$(1)/.flags: FORCE
+	@mkdir -p units/$(1)
+	@echo '$$(FPCFLAGS)' | cmp -s - $$@ || echo '$$(FPCFLAGS)' > $$@
+
+bin/$(1)/lua: $(SRC) units/$(1)/.flags
 	@mkdir -p bin/$(1) units/$(1)
+	@rm -f units/$(1)/*.ppu units/$(1)/*.o
 	$(FPC) $(FPCFLAGS) -P$$(firstword $$(subst -, ,$(1))) -T$$(patsubst $$(firstword $$(subst -, ,$(1)))-%,%,$(1)) \
 	  -FUunits/$(1) -FEbin/$(1) -Fusrc -olua src/lua.pas
 
@@ -51,6 +63,11 @@ clean-$(1):
 endef
 
 $(foreach t,$(TARGETS),$(eval $(call target_rule,$(t))))
+
+# time the micro benchmarks of tools/bench with LuRe (native) and, when built, the reference Lua
+REFLUA := lua-5.5.1/src/lua
+bench: $(NATIVE)
+	@tools/bench/run.sh $(wildcard $(REFLUA)) bin/$(NATIVE)/lua
 
 clean-all:
 	rm -rf bin units

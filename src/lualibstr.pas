@@ -61,104 +61,123 @@ end;
 
 function str_sub(L: TLua): Integer;
 var
-  s: RawByteString;
+  s: TStringObj;
   ln, start, e: SizeUInt;
 begin
-  s := CheckString(L, 1);
-  ln := Length(s);
+  s := CheckStr(L, 1);
+  ln := s.Len;
   start := PosRelatI(CheckInteger(L, 2), ln);
   e := GetEndPos(L, 3, -1, ln);
   if start <= e then
-    PushStr(L, Copy(s, start, e - start + 1))
+    PushBuf(L, s.Data + (start - 1), e - start + 1)
   else
-    PushStr(L, '');
+    PushBuf(L, nil, 0);
   Result := 1;
 end;
 
+// the functions below work on raw bytes and keep no managed locals (those would
+// make each call set up an exception frame)
+
 function str_reverse(L: TLua): Integer;
 var
-  s, r: RawByteString;
-  i, n: Integer;
+  s: TStringObj;
+  buf: array[0..255] of Byte;
+  p, q: PByte;
+  i, n: SizeInt;
 begin
-  s := CheckString(L, 1);
-  n := Length(s);
-  SetLength(r, n);
-  for i := 1 to n do r[i] := s[n - i + 1];
-  PushStr(L, r);
+  s := CheckStr(L, 1);
+  n := s.Len;
+  if n <= SizeOf(buf) then q := @buf[0] else q := GetMem(n);
+  p := s.Data;
+  for i := 0 to n - 1 do q[i] := p[n - 1 - i];
+  PushBuf(L, q, n);
+  if q <> @buf[0] then FreeMem(q);
   Result := 1;
 end;
 
 function str_lower(L: TLua): Integer;
 var
-  s: RawByteString;
-  i: Integer;
+  s: TStringObj;
+  buf: array[0..255] of Byte;
+  p, q: PByte;
+  i, n: SizeInt;
 begin
-  s := CheckString(L, 1);
-  UniqueString(s);
-  for i := 1 to Length(s) do
-    s[i] := Chr(c_tolower(Byte(s[i])));
-  PushStr(L, s);
+  s := CheckStr(L, 1);
+  n := s.Len;
+  if n <= SizeOf(buf) then q := @buf[0] else q := GetMem(n);
+  p := s.Data;
+  for i := 0 to n - 1 do q[i] := ToLowerTab[p[i]];
+  PushBuf(L, q, n);
+  if q <> @buf[0] then FreeMem(q);
   Result := 1;
 end;
 
 function str_upper(L: TLua): Integer;
 var
-  s: RawByteString;
-  i: Integer;
+  s: TStringObj;
+  buf: array[0..255] of Byte;
+  p, q: PByte;
+  i, n: SizeInt;
 begin
-  s := CheckString(L, 1);
-  UniqueString(s);
-  for i := 1 to Length(s) do
-    s[i] := Chr(c_toupper(Byte(s[i])));
-  PushStr(L, s);
+  s := CheckStr(L, 1);
+  n := s.Len;
+  if n <= SizeOf(buf) then q := @buf[0] else q := GetMem(n);
+  p := s.Data;
+  for i := 0 to n - 1 do q[i] := ToUpperTab[p[i]];
+  PushBuf(L, q, n);
+  if q <> @buf[0] then FreeMem(q);
   Result := 1;
 end;
 
 function str_rep(L: TLua): Integer;
 var
-  s, sep, r: RawByteString;
+  s, sep: TStringObj;
   n: Int64;
-  ln, lsep, total: Int64;
-  i, pos: Int64;
+  ln, lsep, total, i: Int64;
+  r, q: PByte;
 begin
-  s := CheckString(L, 1);
+  s := CheckStr(L, 1);
   n := CheckInteger(L, 2);
-  sep := OptString(L, 3, '');
-  ln := Length(s);
-  lsep := Length(sep);
+  if ArgIsNoneOrNil(L, 3) then sep := nil else sep := CheckStr(L, 3);
+  ln := s.Len;
+  if sep = nil then lsep := 0 else lsep := sep.Len;
   if n <= 0 then
   begin
-    PushStr(L, '');
+    PushBuf(L, nil, 0);
     Exit(1);
   end;
   if (ln + lsep < ln) or (ln + lsep > MAXSIZE div n) then
     LuaError(L, 'resulting string too large');
   total := n * ln + (n - 1) * lsep;
-  SetLength(r, total);
-  pos := 1;
+  r := GetMem(total + 1);
+  q := r;
   for i := 1 to n do
   begin
-    if ln > 0 then Move(s[1], r[pos], ln);
-    Inc(pos, ln);
+    if ln > 0 then
+    begin
+      Move(s.Data^, q^, ln);
+      Inc(q, ln);
+    end;
     if (i < n) and (lsep > 0) then
     begin
-      Move(sep[1], r[pos], lsep);
-      Inc(pos, lsep);
+      Move(sep.Data^, q^, lsep);
+      Inc(q, lsep);
     end;
   end;
-  PushStr(L, r);
+  PushBuf(L, r, total);
+  FreeMem(r);
   Result := 1;
 end;
 
 function str_byte(L: TLua): Integer;
 var
-  s: RawByteString;
+  s: TStringObj;
   ln, posi, pose: SizeUInt;
   pi: Int64;
   n, i: Integer;
 begin
-  s := CheckString(L, 1);
-  ln := Length(s);
+  s := CheckStr(L, 1);
+  ln := s.Len;
   pi := OptInteger(L, 2, 1);
   pose := GetEndPos(L, 3, pi, ln);
   posi := PosRelatI(pi, ln);
@@ -168,25 +187,31 @@ begin
   n := Integer(pose - posi) + 1;
   L.EnsureStack(L.Top + n + 5);
   for i := 0 to n - 1 do
-    PushInt(L, Byte(s[posi + SizeUInt(i)]));
+    PushInt(L, s.Data[posi - 1 + SizeUInt(i)]);
   Result := n;
 end;
 
 function str_char(L: TLua): Integer;
 var
   n, i: Integer;
-  r: RawByteString;
+  buf: array[0..255] of Byte;
+  q: PByte;
   c: Int64;
 begin
   n := LuaGetTop(L);
-  SetLength(r, n);
+  if n <= SizeOf(buf) then q := @buf[0] else q := GetMem(n);
   for i := 1 to n do
   begin
     c := CheckInteger(L, i);
-    if QWord(c) > 255 then ArgError(L, i, 'value out of range');
-    r[i] := Chr(c);
+    if QWord(c) > 255 then
+    begin
+      if q <> @buf[0] then FreeMem(q);
+      ArgError(L, i, 'value out of range');
+    end;
+    q[i - 1] := Byte(c);
   end;
-  PushStr(L, r);
+  PushBuf(L, q, n);
+  if q <> @buf[0] then FreeMem(q);
   Result := 1;
 end;
 
@@ -238,7 +263,7 @@ function c_isalnum(c: Integer): Integer; cdecl; external 'c' name 'isalnum';
 
 function IsAlpha(c: Byte): Boolean; inline;
 begin
-  Result := c_isalpha(c) <> 0;
+  Result := (CTypeTab[c] and CT_ALPHA) <> 0;
 end;
 
 function IsDigit(c: Byte): Boolean; inline;
@@ -248,47 +273,47 @@ end;
 
 function IsLower(c: Byte): Boolean; inline;
 begin
-  Result := c_islower(c) <> 0;
+  Result := (CTypeTab[c] and CT_LOWER) <> 0;
 end;
 
 function IsUpper(c: Byte): Boolean; inline;
 begin
-  Result := c_isupper(c) <> 0;
+  Result := (CTypeTab[c] and CT_UPPER) <> 0;
 end;
 
 function IsSpace(c: Byte): Boolean; inline;
 begin
-  Result := c_isspace(c) <> 0;
+  Result := (CTypeTab[c] and CT_SPACE) <> 0;
 end;
 
 function IsCntrl(c: Byte): Boolean; inline;
 begin
-  Result := c_iscntrl(c) <> 0;
+  Result := (CTypeTab[c] and CT_CNTRL) <> 0;
 end;
 
 function IsGraph(c: Byte): Boolean; inline;
 begin
-  Result := c_isgraph(c) <> 0;
+  Result := (CTypeTab[c] and CT_GRAPH) <> 0;
 end;
 
 function IsPunct(c: Byte): Boolean; inline;
 begin
-  Result := c_ispunct(c) <> 0;
+  Result := (CTypeTab[c] and CT_PUNCT) <> 0;
 end;
 
 function IsXDigit(c: Byte): Boolean; inline;
 begin
-  Result := c_isxdigit(c) <> 0;
+  Result := (CTypeTab[c] and CT_XDIGIT) <> 0;
 end;
 
 function IsAlnum(c: Byte): Boolean; inline;
 begin
-  Result := c_isalnum(c) <> 0;
+  Result := (CTypeTab[c] and CT_ALNUM) <> 0;
 end;
 
 function ToLowerB(c: Byte): Byte; inline;
 begin
-  Result := Byte(c_tolower(c));
+  Result := ToLowerTab[c];
 end;
 
 function MatchClass(c, cl: Byte): Boolean;
@@ -665,7 +690,7 @@ begin
   begin
     if i <> 0 then
       LuaError(ms.L, Format('invalid capture index %%%d', [i + 1]));
-    PushStr(ms.L, StrFromMem(s, e - s));
+    PushBuf(ms.L, s, e - s);
   end
   else
   begin
@@ -675,7 +700,7 @@ begin
     else if l = CAP_POSITION then
       PushInt(ms.L, (ms.Capture[i].Init - ms.SrcInit) + 1)
     else
-      PushStr(ms.L, StrFromMem(ms.Capture[i].Init, l));
+      PushBuf(ms.L, ms.Capture[i].Init, l);
   end;
 end;
 
@@ -736,8 +761,8 @@ begin
     PushFail(L);
     Exit(1);
   end;
-  s := StrPtr(sstr.Str);
-  p := StrPtr(pstr.Str);
+  s := sstr.Data;
+  p := pstr.Data;
   if find and (Truthy(LuaArg(L, 4)) or NoSpecials(p, lp)) then
   begin
     res := MemFind(s + init, ls - init, p, lp);
@@ -803,8 +828,8 @@ begin
   pstr := f.CVals[1].S;
   pos := f.CVals[2].I;
   lastpos := f.CVals[3].I;
-  s0 := StrPtr(sstr.Str);
-  p0 := StrPtr(pstr.Str);
+  s0 := sstr.Data;
+  p0 := pstr.Data;
   PrepState(ms, L, s0, p0, sstr.Len, pstr.Len);
   if lastpos >= 0 then lastmatch := s0 + lastpos else lastmatch := nil;
   src := s0 + pos;
@@ -843,16 +868,39 @@ begin
 end;
 
 // appends the replacement for a match
-function AddValue(var ms: TMatchState; var b: RawByteString; s, e: PByte; tr: TValueType): Boolean;
+procedure BufAddNumber(var b: TBuf; constref r: TLuaValue);
+begin
+  BufAddStr(b, RawByteString(NumToStr(r)));
+end;
+
+procedure BufAddPosition(var b: TBuf; pos: Int64);
+begin
+  BufAddStr(b, RawByteString(IntToStr(pos)));
+end;
+
+procedure ReplError(L: TLua; const msg: string; idx: Integer);
+begin
+  if idx > 0 then
+    LuaError(L, Format(msg, [idx]))
+  else
+    LuaError(L, msg);
+end;
+
+procedure BadReplacement(L: TLua; constref r: TLuaValue);
+begin
+  LuaError(L, Format('invalid replacement value (a %s)', [VTypeName(r)]));
+end;
+
+// appends the replacement of the match s..e to b; False when the original text was kept
+// (no managed locals here: this runs once per match)
+function AddValue(var ms: TMatchState; var b: TBuf; s, e: PByte; tr: TValueType): Boolean;
 var
   L: TLua;
   r: TLuaValue;
-  news: RawByteString;
-  i, n, base: Integer;
+  ns: TStringObj;
+  i, n, idx: Integer;
   c: Byte;
-  cap: PByte;
-  capl: Integer;
-  idx: Integer;
+  np: PByte;
 begin
   L := ms.L;
   case tr of
@@ -860,7 +908,7 @@ begin
       LuaPush(L, LuaArg(L, 3));
       n := PushCaptures(ms, s, e);
       LuaCall(L, n, 1);
-      r := L.Stack[L.Top - 1];
+      CopyVal(@r, @L.Stack[L.Top - 1]);
       Dec(L.Top);
     end;
     vtTab: begin
@@ -871,65 +919,59 @@ begin
   else
     begin
       // string replacement
-      news := LuaArg(L, 3).S.Str;
-      base := 1;
-      i := 1;
-      while i <= Length(news) do
+      ns := ArgPtr(L, 3)^.S;
+      np := ns.Data;
+      i := 0;
+      while i < Integer(ns.Len) do
       begin
-        if news[i] <> '%' then
+        if np[i] <> Ord('%') then
         begin
-          b := b + news[i];
+          BufAddByte(b, np[i]);
           Inc(i);
           Continue;
         end;
         Inc(i);
-        if i > Length(news) then
-          LuaError(L, 'invalid use of ''%'' in replacement string');
-        c := Byte(news[i]);
+        if i >= Integer(ns.Len) then
+          ReplError(L, 'invalid use of ''%'' in replacement string', 0);
+        c := np[i];
         if c = L_ESC then
-          b := b + '%'
+          BufAddByte(b, Ord('%'))
         else if c = Ord('0') then
-          b := b + StrFromMem(s, e - s)
+          BufAdd(b, s, e - s)
         else if IsDigit(c) then
         begin
           idx := c - Ord('1');
           if idx >= ms.Level then
           begin
             if idx <> 0 then
-              LuaError(L, Format('invalid capture index %%%d in replacement string', [idx + 1]));
-            b := b + StrFromMem(s, e - s);
+              ReplError(L, 'invalid capture index %%%d in replacement string', idx + 1);
+            BufAdd(b, s, e - s);
           end
+          else if ms.Capture[idx].Len = CAP_UNFINISHED then
+            ReplError(L, 'unfinished capture', 0)
+          else if ms.Capture[idx].Len = CAP_POSITION then
+            BufAddPosition(b, (ms.Capture[idx].Init - ms.SrcInit) + 1)
           else
-          begin
-            capl := ms.Capture[idx].Len;
-            cap := ms.Capture[idx].Init;
-            if capl = CAP_UNFINISHED then
-              LuaError(L, 'unfinished capture')
-            else if capl = CAP_POSITION then
-              b := b + RawByteString(IntToStr((cap - ms.SrcInit) + 1))
-            else
-              b := b + StrFromMem(cap, capl);
-          end;
+            BufAdd(b, ms.Capture[idx].Init, ms.Capture[idx].Len);
         end
         else
-          LuaError(L, 'invalid use of ''%'' in replacement string');
+          ReplError(L, 'invalid use of ''%'' in replacement string', 0);
         Inc(i);
       end;
-      if base < 0 then ;
       Exit(True);
     end;
   end;
-  if not Truthy(r) then
+  if (r.Vt = vtNil) or ((r.Vt = vtBool) and (not r.B)) then
   begin
-    b := b + StrFromMem(s, e - s);   // keep original text
+    BufAdd(b, s, e - s);   // keep original text
     Exit(False);
   end;
   if r.Vt = vtStr then
-    b := b + r.S.Str
-  else if r.Vt in [vtInt, vtFlt] then
-    b := b + RawByteString(NumToStr(r))
+    BufAdd(b, r.S.Data, r.S.Len)
+  else if (r.Vt = vtInt) or (r.Vt = vtFlt) then
+    BufAddNumber(b, r)
   else
-    LuaError(L, Format('invalid replacement value (a %s)', [VTypeName(r)]));
+    BadReplacement(L, r);
   Result := True;
 end;
 
@@ -941,7 +983,7 @@ var
   maxS, n: Int64;
   anchor, changed: Boolean;
   ms: TMatchState;
-  b: RawByteString;
+  b: TBuf;
   lp: SizeUInt;
   v: TLuaValue;
 begin
@@ -956,8 +998,8 @@ begin
   if v.Vt in [vtInt, vtFlt] then
     L.Stack[LuaAbsIndex(L, 3)] := LuaStr(L.NewString(RawByteString(NumToStr(v))));
   maxS := OptInteger(L, 4, Int64(sstr.Len) + 1);
-  src := StrPtr(sstr.Str);
-  p := StrPtr(pstr.Str);
+  src := sstr.Data;
+  p := pstr.Data;
   lp := pstr.Len;
   anchor := (lp > 0) and (p^ = Ord('^'));
   if anchor then
@@ -965,37 +1007,41 @@ begin
     Inc(p);
     Dec(lp);
   end;
-  PrepState(ms, L, StrPtr(sstr.Str), p, sstr.Len, lp);
+  PrepState(ms, L, sstr.Data, p, sstr.Len, lp);
   lastmatch := nil;
   n := 0;
   changed := False;
-  b := '';
-  while n < maxS do
-  begin
-    RePrepState(ms);
-    e := Match(@ms, src, p);
-    if (e <> nil) and (e <> lastmatch) then
+  BufInit(b);
+  try
+    while n < maxS do
     begin
-      Inc(n);
-      if AddValue(ms, b, src, e, tr) then changed := True;
-      src := e;
-      lastmatch := e;
-    end
-    else if src < ms.SrcEnd then
-    begin
-      b := b + Chr(src^);
-      Inc(src);
-    end
+      RePrepState(ms);
+      e := Match(@ms, src, p);
+      if (e <> nil) and (e <> lastmatch) then
+      begin
+        Inc(n);
+        if AddValue(ms, b, src, e, tr) then changed := True;
+        src := e;
+        lastmatch := e;
+      end
+      else if src < ms.SrcEnd then
+      begin
+        BufAddByte(b, src^);
+        Inc(src);
+      end
+      else
+        Break;
+      if anchor then Break;
+    end;
+    if not changed then
+      LuaPush(L, LuaArg(L, 1))
     else
-      Break;
-    if anchor then Break;
-  end;
-  if not changed then
-    LuaPush(L, LuaArg(L, 1))
-  else
-  begin
-    b := b + StrFromMem(src, ms.SrcEnd - src);
-    PushStr(L, b);
+    begin
+      BufAdd(b, src, ms.SrcEnd - src);
+      PushBuf(L, b.P, b.Len);
+    end;
+  finally
+    BufFree(b);
   end;
   PushInt(L, n);
   Result := 2;

@@ -26,15 +26,15 @@ function ShiftLeft(x, y: Int64): Int64;
 function ShiftRight(x, y: Int64): Int64;
 
 // operations on two numbers (integers or floats); op is an OP_* code
-function ArithNum(op: Integer; const a, b: TLuaValue; var res: TLuaValue): TArithResult;
+function ArithNum(op: Integer; constref a, b: TLuaValue; var res: TLuaValue): TArithResult;
 
-function NumLess(const a, b: TLuaValue): Boolean;
-function NumLessEq(const a, b: TLuaValue): Boolean;
-function IsNumber(const v: TLuaValue): Boolean; inline;
+function NumLess(constref a, b: TLuaValue): Boolean;
+function NumLessEq(constref a, b: TLuaValue): Boolean;
+function IsNumber(constref v: TLuaValue): Boolean; inline;
 
 implementation
 
-function IsNumber(const v: TLuaValue): Boolean;
+function IsNumber(constref v: TLuaValue): Boolean;
 begin
   Result := (v.Vt = vtInt) or (v.Vt = vtFlt);
 end;
@@ -90,7 +90,7 @@ begin
   Result := ShiftLeft(x, -y);
 end;
 
-function ArithNum(op: Integer; const a, b: TLuaValue; var res: TLuaValue): TArithResult;
+function ArithNum(op: Integer; constref a, b: TLuaValue; var res: TLuaValue): TArithResult;
 var
   ia, ib: Int64;
   fa, fb: Double;
@@ -104,12 +104,12 @@ begin
       if b.Vt = vtInt then ib := b.I
       else if not FloatToInt(b.N, ib, F2I_EQ) then Exit(arNoInteger);
       case op of
-        OP_BAND: res := LuaInt(ia and ib);
-        OP_BOR: res := LuaInt(ia or ib);
-        OP_BXOR: res := LuaInt(ia xor ib);
-        OP_SHL: res := LuaInt(ShiftLeft(ia, ib));
-        OP_SHR: res := LuaInt(ShiftRight(ia, ib));
-        OP_BNOT: res := LuaInt(not ia);
+        OP_BAND: SetIntV(@res, ia and ib);
+        OP_BOR: SetIntV(@res, ia or ib);
+        OP_BXOR: SetIntV(@res, ia xor ib);
+        OP_SHL: SetIntV(@res, ShiftLeft(ia, ib));
+        OP_SHR: SetIntV(@res, ShiftRight(ia, ib));
+        OP_BNOT: SetIntV(@res, not ia);
       end;
       Exit;
     end;
@@ -120,18 +120,18 @@ begin
     ia := a.I;
     ib := b.I;
     case op of
-      OP_ADD: begin res := LuaInt(Int64(QWord(ia) + QWord(ib))); Exit; end;
-      OP_SUB: begin res := LuaInt(Int64(QWord(ia) - QWord(ib))); Exit; end;
-      OP_MUL: begin res := LuaInt(Int64(QWord(ia) * QWord(ib))); Exit; end;
-      OP_UNM: begin res := LuaInt(Int64(QWord(0) - QWord(ia))); Exit; end;
+      OP_ADD: begin SetIntV(@res, Int64(QWord(ia) + QWord(ib))); Exit; end;
+      OP_SUB: begin SetIntV(@res, Int64(QWord(ia) - QWord(ib))); Exit; end;
+      OP_MUL: begin SetIntV(@res, Int64(QWord(ia) * QWord(ib))); Exit; end;
+      OP_UNM: begin SetIntV(@res, Int64(QWord(0) - QWord(ia))); Exit; end;
       OP_MOD: begin
         if ib = 0 then Exit(arModZero);
-        res := LuaInt(IntMod(ia, ib));
+        SetIntV(@res, IntMod(ia, ib));
         Exit;
       end;
       OP_IDIV: begin
         if ib = 0 then Exit(arDivZero);
-        res := LuaInt(IntDiv(ia, ib));
+        SetIntV(@res, IntDiv(ia, ib));
         Exit;
       end;
     end;
@@ -139,14 +139,14 @@ begin
   if a.Vt = vtInt then fa := Double(a.I) else fa := a.N;
   if b.Vt = vtInt then fb := Double(b.I) else fb := b.N;
   case op of
-    OP_ADD: res := LuaNum(fa + fb);
-    OP_SUB: res := LuaNum(fa - fb);
-    OP_MUL: res := LuaNum(fa * fb);
-    OP_DIV: res := LuaNum(fa / fb);
-    OP_POW: if fb = 2 then res := LuaNum(fa * fa) else res := LuaNum(c_pow(fa, fb));
-    OP_IDIV: res := LuaNum(c_floor(fa / fb));
-    OP_MOD: res := LuaNum(FltMod(fa, fb));
-    OP_UNM: res := LuaNum(-fa);
+    OP_ADD: SetFltV(@res, fa + fb);
+    OP_SUB: SetFltV(@res, fa - fb);
+    OP_MUL: SetFltV(@res, fa * fb);
+    OP_DIV: SetFltV(@res, fa / fb);
+    OP_POW: if fb = 2 then SetFltV(@res, fa * fa) else SetFltV(@res, c_pow(fa, fb));
+    OP_IDIV: SetFltV(@res, c_floor(fa / fb));
+    OP_MOD: SetFltV(@res, FltMod(fa, fb));
+    OP_UNM: SetFltV(@res, -fa);
   end;
 end;
 
@@ -191,7 +191,7 @@ begin
   Result := f < 0;
 end;
 
-function NumLess(const a, b: TLuaValue): Boolean;
+function NumLess(constref a, b: TLuaValue): Boolean;
 begin
   if a.Vt = vtInt then
   begin
@@ -205,7 +205,7 @@ begin
   end;
 end;
 
-function NumLessEq(const a, b: TLuaValue): Boolean;
+function NumLessEq(constref a, b: TLuaValue): Boolean;
 begin
   if a.Vt = vtInt then
   begin

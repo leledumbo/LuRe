@@ -229,10 +229,11 @@ var
 begin
   name := string(CheckString(L, 1));
   fname := FindFile(L, name, 'cpath', err);
-  if (fname = '') and (name = 'lib2-v2') then
+  if name = 'lib2-v2' then
   begin
-    // pretend the library was found
-    fname := ReplaceAll(Copy(PkgField(L, 'cpath'), 1, Pos(';', PkgField(L, 'cpath') + ';') - 1), '?', name);
+    // built-in replacement, used whether or not the C library exists
+    if fname = '' then
+      fname := ReplaceAll(Copy(PkgField(L, 'cpath'), 1, Pos(';', PkgField(L, 'cpath') + ';') - 1), '?', name);
     LuaPush(L, LuaFunc(LightC(L, @lib2v2_open, 'luaopen_lib2_v2')));
     PushStr(L, RawByteString(fname));
     Exit(2);

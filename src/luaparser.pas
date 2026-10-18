@@ -129,7 +129,7 @@ type
     procedure SingleVarAux(scope: TFuncScope; name: TStringObj; var res: TVarRes; base: Boolean);
     function BuildGlobal(name: TStringObj; line: Integer): TExpr;
     function BuildVar(name: TStringObj; line: Integer): TExpr;
-    function ConstExpr(const v: TLuaValue; line: Integer): TExpr;
+    function ConstExpr(constref v: TLuaValue; line: Integer): TExpr;
     // goto / labels
     procedure NewGoto(name: TStringObj; line: Integer; stmt: TStmt);
     procedure CreateLabel(name: TStringObj; line: Integer; last: Boolean; stmt: TStmt);
@@ -529,7 +529,7 @@ begin
   res.UpIdx := idx;
 end;
 
-function TParser.ConstExpr(const v: TLuaValue; line: Integer): TExpr;
+function TParser.ConstExpr(constref v: TLuaValue; line: Integer): TExpr;
 begin
   case v.Vt of
     vtNil: Result := NewExpr(ekNil, line);

@@ -20,7 +20,7 @@ const
   TAB_L = 4;   // length
   RANLIMIT = 100;
 
-function HasMeta(L: TLua; const v: TLuaValue; const name: string): Boolean;
+function HasMeta(L: TLua; constref v: TLuaValue; const name: string): Boolean;
 begin
   Result := GetMetaField(L, v, name).Vt <> vtNil;
 end;
@@ -55,15 +55,15 @@ begin
   Result := v.I;
 end;
 
-function GetI(L: TLua; const t: TLuaValue; i: Int64): TLuaValue; inline;
+function GetI(L: TLua; constref t: TLuaValue; i: Int64): TLuaValue; inline;
 begin
   if (t.Vt = vtTab) and (t.T.Metatable = nil) then
-    Result := TableGetInt(t.T, i)
+    CopyVal(@Result, TableGetIntP(t.T, i))
   else
     Result := LuaIndex(L, t, LuaInt(i));
 end;
 
-procedure SetI(L: TLua; const t: TLuaValue; i: Int64; const v: TLuaValue); inline;
+procedure SetI(L: TLua; constref t: TLuaValue; i: Int64; constref v: TLuaValue); inline;
 begin
   if (t.Vt = vtTab) and (t.T.Metatable = nil) then
     TableSetInt(t.T, i, v)
@@ -242,31 +242,35 @@ type
     Func: TLuaValue;
   end;
 
-function SortLess(var c: TSortCtx; const a, b: TLuaValue): Boolean;
-var
-  r: TLuaValue;
+function SortLess(var c: TSortCtx; constref a, b: TLuaValue): Boolean;
 begin
   if c.HasFunc then
   begin
-    LuaPush(c.L, c.Func);
-    LuaPush(c.L, a);
-    LuaPush(c.L, b);
+    if c.L.Top + 4 > c.L.StackSize then c.L.EnsureStack(c.L.Top + 4);
+    CopyVal(@c.L.Stack[c.L.Top], @c.Func);
+    CopyVal(@c.L.Stack[c.L.Top + 1], @a);
+    CopyVal(@c.L.Stack[c.L.Top + 2], @b);
+    Inc(c.L.Top, 3);
     LuaCall(c.L, 2, 1);
-    r := c.L.Stack[c.L.Top - 1];
     Dec(c.L.Top);
-    Result := Truthy(r);
+    with c.L.Stack[c.L.Top] do
+      Result := (Vt <> vtNil) and ((Vt <> vtBool) or B);
   end
+  else if (a.Vt = vtInt) and (b.Vt = vtInt) then
+    Result := a.I < b.I
+  else if (a.Vt = vtFlt) and (b.Vt = vtFlt) then
+    Result := a.N < b.N
   else
     Result := LuaLessThan(c.L, a, b);
 end;
 
-procedure SetPair(var c: TSortCtx; i, j: Int64; const vi, vj: TLuaValue);
+procedure SetPair(var c: TSortCtx; i, j: Int64; constref vi, vj: TLuaValue);
 begin
   SetI(c.L, c.T, i, vj);
   SetI(c.L, c.T, j, vi);
 end;
 
-function Partition(var c: TSortCtx; lo, up: Int64; const pv: TLuaValue): Int64;
+function Partition(var c: TSortCtx; lo, up: Int64; constref pv: TLuaValue): Int64;
 var
   i, j: Int64;
   vi, vj: TLuaValue;

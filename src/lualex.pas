@@ -638,7 +638,8 @@ begin
           t.Name := BufText;
           t.Kind := tkName;
           for k := tkAnd to tkWhile do
-            if (ReservedWords[k] = t.Name) and (k <> tkGlobal) then  // 'global' is contextual
+            if (ReservedWords[k][1] = t.Name[1]) and (Length(ReservedWords[k]) = Length(t.Name)) and
+               (ReservedWords[k] = t.Name) and (k <> tkGlobal) then  // 'global' is contextual
             begin
               t.Kind := k;
               Break;
