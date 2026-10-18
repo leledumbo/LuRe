@@ -19,6 +19,12 @@ procedure OpenCoroutine(L: TLua);
 // the error value (if any) is left in 'err'
 function CloseCoroutine(L, co: TLua; var err: TLuaValue): Boolean;
 
+// resume/yield machinery shared with the C API (luap)
+function ResumeCo(L, co: TLua; nargs: Integer; var nres: Integer): Integer;
+function CoStatusName(L, co: TLua): string;
+procedure XMove(from, dest: TLua; n: Integer);
+function CoYield(L: TLua; n: Integer): Integer;   // yields the top n values; returns the number of values passed to the next resume
+
 const
   CO_STACK_SIZE = 16 * 1024 * 1024;
 
@@ -307,17 +313,15 @@ begin
   Result := nres + 1;
 end;
 
-function luaCo_yield(L: TLua): Integer;
+function CoYield(L: TLua; n: Integer): Integer;
 var
   r: TCoRunner;
-  n: Integer;
 begin
   if (L.Runner = nil) or (L = L.Main) then
     LuaError(L, 'attempt to yield from outside a coroutine');
   if L.NNY > 0 then
     LuaError(L, 'attempt to yield across a C-call boundary');
   r := RunnerOf(L);
-  n := LuaGetTop(L);
   r.YieldBase := L.Top - n;
   r.YieldN := n;
   L.Status := ST_YIELD;
@@ -327,6 +331,11 @@ begin
     raise ELuaKill.Create('coroutine killed');
   // resumed: the arguments of resume are on the stack top
   Result := L.Top - r.YieldBase;
+end;
+
+function luaCo_yield(L: TLua): Integer;
+begin
+  Result := CoYield(L, LuaGetTop(L));
 end;
 
 function luaCo_status(L: TLua): Integer;

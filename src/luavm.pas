@@ -85,6 +85,9 @@ procedure SetHookState(L: TThread; constref func: TLuaValue; mask, count: Intege
 
 procedure LuaInitVM(L: TLua);
 
+// pushes a call-info record (used by the C API to give a state its base frame)
+procedure PushCI(L: TThread; f: TFunction; funcIdx, base, top, nresults: Integer; isC: Boolean);
+
 implementation
 
 var

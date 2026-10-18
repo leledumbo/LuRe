@@ -24,7 +24,7 @@ SRC := $(wildcard src/*.pas)
 
 .DEFAULT_GOAL := help
 
-.PHONY: help bench clean clean-all FORCE $(TARGETS)
+.PHONY: help bench test-api clean clean-all FORCE $(TARGETS)
 
 FORCE:
 
@@ -37,6 +37,7 @@ help:
 	done
 	@echo
 	@echo "  bench             time tools/bench/*.lua (native LuRe, and the reference if built)"
+	@echo "  test-api          build and run tests-api/apitest.pas (the luap/lauxlibp/lualibp C API units)"
 	@echo "  clean-all         remove bin/ and units/"
 	@echo "  clean-<FPCTARGET> remove the output of one target"
 	@echo
@@ -68,6 +69,12 @@ $(foreach t,$(TARGETS),$(eval $(call target_rule,$(t))))
 REFLUA := lua-5.5.1/src/lua
 bench: $(NATIVE)
 	@tools/bench/run.sh $(wildcard $(REFLUA)) bin/$(NATIVE)/lua
+
+# tests of the Lua C API units (luap, lauxlibp, lualibp) with the native compiler
+test-api: $(SRC) tests-api/apitest.pas
+	@mkdir -p bin/$(NATIVE) units/$(NATIVE)/api
+	$(FPC) $(FPCFLAGS) -FUunits/$(NATIVE)/api -FEbin/$(NATIVE) -Fusrc tests-api/apitest.pas
+	bin/$(NATIVE)/apitest
 
 clean-all:
 	rm -rf bin units
