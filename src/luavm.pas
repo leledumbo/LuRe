@@ -1,6 +1,7 @@
 unit luavm;
 
-{$mode objfpc}{$H+}
+{$mode objfpc}
+{$H+}
 {$R-}{$Q-}
 {$POINTERMATH ON}
 {$GOTO ON}
@@ -727,9 +728,22 @@ end;
 { calls                                                                  }
 { ===================================================================== }
 
+// a fresh frame record: the zeroed group in three stores, then the hand-over of '__call' arguments
+procedure ResetCI(ci: PCallInfo); inline;
+begin
+  ci^.Zero[0] := 0;
+  ci^.Zero[1] := 0;
+  ci^.Zero[2] := 0;
+  if PendingExtra <> 0 then
+  begin
+    ci^.ExtraArgs := PendingExtra;
+    PendingExtra := 0;
+  end;
+end;
+
 procedure PushCI(L: TThread; f: TFunction; funcIdx, base, top, nresults: Integer; isC: Boolean);
 var
-  ci: ^TCallInfo;
+  ci: PCallInfo;
 begin
   if L.NCI >= L.CISize then
     raise ELuaError.CreateMsg('stack overflow');
@@ -738,24 +752,15 @@ begin
   ci^.FuncIdx := funcIdx;
   ci^.Base := base;
   ci^.Top := top;
-  ci^.SavedPC := 0;
   ci^.NResults := nresults;
-  ci^.NExtra := 0;
+  ResetCI(ci);
   ci^.IsC := isC;
-  ci^.IsTail := False;
-  ci^.Hooked := False;
-  ci^.Fresh := False;
-  ci^.InFinalizer := False;
-  ci^.FTransfer := 0;
-  ci^.NTransfer := 0;
-  ci^.ExtraArgs := PendingExtra;
-  PendingExtra := 0;
   Inc(L.NCI);
 end;
 
 function ThreadMaxCI(L: TThread): Integer; inline;
 begin
-  if L.Runner = nil then Result := MainMaxCI else Result := CoMaxCI;
+  Result := L.CILimit;
 end;
 
 procedure CallHook(L: TLua; const ev: string; line: Integer); forward;
@@ -1489,7 +1494,7 @@ begin
   if p <> @buf[0] then FreeMem(p);
 end;
 
-// R[first .. first+n-1] are concatenated into R[first]
+// RB[first .. first+n-1] are concatenated into RB[first]
 procedure ConcatRegs(L: TLua; first, n: Integer);
 var
   top, total, k: Integer;
@@ -1543,6 +1548,87 @@ end;
 function GetRK(L: TLua; base: Integer; kk: PLuaValue; x: Integer): PLuaValue; inline;
 begin
   if x >= 0 then Result := @L.Stack[base + x] else Result := @kk[-1 - x];
+end;
+
+function GetRKR(RB, kk: PLuaValue; x: Integer): PLuaValue; inline;
+begin
+  if x >= 0 then Result := @RB[x] else Result := @kk[-1 - x];
+end;
+
+function FastAdd(d, b, c: PLuaValue): Boolean; inline;
+begin
+  Result := True;
+  if b^.Vt = vtInt then
+  begin
+    if c^.Vt = vtInt then SetIntV(d, Int64(QWord(b^.I) + QWord(c^.I)))
+    else if c^.Vt = vtFlt then SetFltV(d, b^.I + c^.N)
+    else Result := False;
+  end
+  else if b^.Vt = vtFlt then
+  begin
+    if c^.Vt = vtFlt then SetFltV(d, b^.N + c^.N)
+    else if c^.Vt = vtInt then SetFltV(d, b^.N + c^.I)
+    else Result := False;
+  end
+  else Result := False;
+end;
+
+function FastSub(d, b, c: PLuaValue): Boolean; inline;
+begin
+  Result := True;
+  if b^.Vt = vtInt then
+  begin
+    if c^.Vt = vtInt then SetIntV(d, Int64(QWord(b^.I) - QWord(c^.I)))
+    else if c^.Vt = vtFlt then SetFltV(d, b^.I - c^.N)
+    else Result := False;
+  end
+  else if b^.Vt = vtFlt then
+  begin
+    if c^.Vt = vtFlt then SetFltV(d, b^.N - c^.N)
+    else if c^.Vt = vtInt then SetFltV(d, b^.N - c^.I)
+    else Result := False;
+  end
+  else Result := False;
+end;
+
+function FastMul(d, b, c: PLuaValue): Boolean; inline;
+begin
+  Result := True;
+  if b^.Vt = vtInt then
+  begin
+    if c^.Vt = vtInt then SetIntV(d, Int64(QWord(b^.I) * QWord(c^.I)))
+    else if c^.Vt = vtFlt then SetFltV(d, b^.I * c^.N)
+    else Result := False;
+  end
+  else if b^.Vt = vtFlt then
+  begin
+    if c^.Vt = vtFlt then SetFltV(d, b^.N * c^.N)
+    else if c^.Vt = vtInt then SetFltV(d, b^.N * c^.I)
+    else Result := False;
+  end
+  else Result := False;
+end;
+
+// 1/0: the comparison of two numbers; 2: not both numbers of the same kind
+function FastLT(b, c: PLuaValue): Integer; inline;
+begin
+  if (b^.Vt = vtInt) and (c^.Vt = vtInt) then Result := Ord(b^.I < c^.I)
+  else if (b^.Vt = vtFlt) and (c^.Vt = vtFlt) then Result := Ord(b^.N < c^.N)
+  else Result := 2;
+end;
+
+// 1/0: the comparison of two numbers; 2: not both numbers of the same kind
+function FastLE(b, c: PLuaValue): Integer; inline;
+begin
+  if (b^.Vt = vtInt) and (c^.Vt = vtInt) then Result := Ord(b^.I <= c^.I)
+  else if (b^.Vt = vtFlt) and (c^.Vt = vtFlt) then Result := Ord(b^.N <= c^.N)
+  else Result := 2;
+end;
+
+// index of an instruction (the record size is 16: a shift, not a signed division)
+function PCOf(ip, code: PInstruction): Integer; inline;
+begin
+  Result := (PtrUInt(ip) - PtrUInt(code)) shr 4;
 end;
 
 function RKKind(x: Integer): TOperandKind; inline;
@@ -1735,8 +1821,7 @@ begin
   top := nbase + p.MaxStackSize;
   // fast path: plain function, room on both stacks, no hook/handler slack in use
   if (not p.IsVararg) and (L.NCI < ThreadMaxCI(L)) and (StackSlack = 0) and
-     (top + p.NumParams + LUA_MINSTACK + 2 + nargs <= L.StackSize) and
-     (top + p.NumParams + LUA_MINSTACK + 2 + nargs <= MAXSTACK) then
+     (top + p.NumParams + LUA_MINSTACK + 2 + nargs <= L.FastLimit) then
   begin
     for i := nargs to p.NumParams - 1 do L.Stack[nbase + i].Vt := vtNil;
     L.Top := top;
@@ -1745,18 +1830,8 @@ begin
     ci^.FuncIdx := funcIdx;
     ci^.Base := nbase;
     ci^.Top := top;
-    ci^.SavedPC := 0;
     ci^.NResults := nres;
-    ci^.NExtra := 0;
-    ci^.IsC := False;
-    ci^.IsTail := False;
-    ci^.Hooked := False;
-    ci^.Fresh := False;
-    ci^.InFinalizer := False;
-    ci^.FTransfer := 0;
-    ci^.NTransfer := 0;
-    ci^.ExtraArgs := PendingExtra;
-    PendingExtra := 0;
+    ResetCI(ci);
     Inc(L.NCI);
     Exit;
   end;
@@ -1801,7 +1876,7 @@ var
 begin
   cidx := L.NCI - 1;
   p := f.Proto;
-  code := @p.Code[0];
+  code := PInstruction(p.Code);
   nextra := ci^.NExtra;
   ins := @code[pc];
   Inc(pc);
@@ -2394,6 +2469,9 @@ begin
   Result := pc;
 end;
 
+{$macro on}
+{$define VMX_XO := begin ip := code + ExecOther(L, ci, f, kk, base, PCOf(ip, code) - 1); RB := @L.Stack[base]; end}
+
 // The interpreter loop. It keeps only the hot opcodes (with their fast paths) and
 // the frame switching of Lua-to-Lua calls; everything else is done by ExecOther.
 procedure VMExecute(L: TLua);
@@ -2401,7 +2479,8 @@ var
   ci: PCallInfo;
   f: TFunction;
   p: TProto;
-  code, ins, ip: PInstruction;
+  code, ip: PInstruction;
+  RB: PLuaValue;
   kk, vb, vc, vt, tv: PLuaValue;
   np: TProto;
   base, nres, nargs, funcIdx, n, first, i, retNres, r: Integer;
@@ -2416,12 +2495,13 @@ begin
   while True do
   begin
     // (re)load the frame on top of the call stack
-    ci := @L.CI[L.NCI - 1];
+        ci := @L.CI[L.NCI - 1];
     f := ci^.Func;
     p := f.Proto;
-    code := @p.Code[0];
-    if Length(p.K) > 0 then kk := @p.K[0] else kk := nil;
+    code := PInstruction(p.Code);
+    kk := PLuaValue(p.K);
     base := ci^.Base;
+    RB := @L.Stack[base];
     if returning then
     begin
       // a Lua callee returned to this frame: continue after its call instruction
@@ -2447,29 +2527,41 @@ begin
     begin
       if L.HookMask <> 0 then
       begin
-        ci^.SavedPC := (ip - code) + 1;
-        TraceExec(L, p, ip - code);
+        ci^.SavedPC := PCOf(ip, code) + 1;
+        TraceExec(L, p, PCOf(ip, code));
+        RB := @L.Stack[base];
       end;
-      ins := ip;
       Inc(ip);
-      case ins^.Op of
-        OP_MOVE: CopyVal(@L.Stack[base + ins^.A], @L.Stack[base + ins^.B]);
-        OP_LOADK: CopyVal(@L.Stack[base + ins^.A], @kk[ins^.B]);
-        OP_LOADNIL: for i := 0 to ins^.B do L.Stack[base + ins^.A + i].Vt := vtNil;
-        OP_LOADBOOL: SetBoolV(@L.Stack[base + ins^.A], ins^.B <> 0);
-        OP_GETUPVAL: CopyVal(@L.Stack[base + ins^.A], f.Upvals[ins^.B].Ref);
-        OP_SETUPVAL: CopyVal(f.Upvals[ins^.B].Ref, @L.Stack[base + ins^.A]);
+      case (ip - 1)^.Op of
+        OP_MOVE: begin
+          CopyVal(@RB[(ip - 1)^.A], @RB[(ip - 1)^.B]);
+        end;
+        OP_LOADK: begin
+          CopyVal(@RB[(ip - 1)^.A], @kk[(ip - 1)^.B]);
+        end;
+        OP_LOADNIL: begin
+          for i := 0 to (ip - 1)^.B do RB[(ip - 1)^.A + i].Vt := vtNil;
+        end;
+        OP_LOADBOOL: begin
+          SetBoolV(@RB[(ip - 1)^.A], (ip - 1)^.B <> 0);
+        end;
+        OP_GETUPVAL: begin
+          CopyVal(@RB[(ip - 1)^.A], f.Upvals[(ip - 1)^.B].Ref);
+        end;
+        OP_SETUPVAL: begin
+          CopyVal(f.Upvals[(ip - 1)^.B].Ref, @RB[(ip - 1)^.A]);
+        end;
         OP_GETTABUP: begin
-          vb := f.Upvals[ins^.B].Ref;
-          vc := GetRK(L, base, kk, ins^.C);
+          vb := f.Upvals[(ip - 1)^.B].Ref;
+          vc := GetRKR(RB, kk, (ip - 1)^.C);
           vt := nil;
           if (vb^.Vt = vtTab) and (vc^.Vt = vtStr) then vt := IndexStrFast(vb^.T, vc^.S);
-          if vt <> nil then CopyVal(@L.Stack[base + ins^.A], vt)
-          else ip := code + ExecOther(L, ci, f, kk, base, (ip - code) - 1);
+          if vt <> nil then CopyVal(@RB[(ip - 1)^.A], vt)
+          else VMX_XO;
         end;
         OP_GETTABLE: begin
-          vb := @L.Stack[base + ins^.B];
-          vc := GetRK(L, base, kk, ins^.C);
+          vb := @RB[(ip - 1)^.B];
+          vc := GetRKR(RB, kk, (ip - 1)^.C);
           vt := nil;
           if vb^.Vt = vtTab then
           begin
@@ -2480,23 +2572,23 @@ begin
               if (vt^.Vt = vtNil) and (vb^.T.Metatable <> nil) then vt := nil;
             end;
           end;
-          if vt <> nil then CopyVal(@L.Stack[base + ins^.A], vt)
-          else ip := code + ExecOther(L, ci, f, kk, base, (ip - code) - 1);
+          if vt <> nil then CopyVal(@RB[(ip - 1)^.A], vt)
+          else VMX_XO;
         end;
         OP_SETTABLE: begin
-          vb := @L.Stack[base + ins^.A];
-          vc := GetRK(L, base, kk, ins^.B);
-          vt := GetRK(L, base, kk, ins^.C);
+          vb := @RB[(ip - 1)^.A];
+          vc := GetRKR(RB, kk, (ip - 1)^.B);
+          vt := GetRKR(RB, kk, (ip - 1)^.C);
           if (vb^.Vt = vtTab) and (vc^.Vt = vtStr) and NoNewIndex(vb^.T) then
             TableSetStr(vb^.T, vc^.S, vt^)
           else if (vb^.Vt = vtTab) and (vc^.Vt = vtInt) and NoNewIndex(vb^.T) then
             TableSetInt(vb^.T, vc^.I, vt^)
           else
-            ip := code + ExecOther(L, ci, f, kk, base, (ip - code) - 1);
+            VMX_XO;
         end;
         OP_SELF: begin
-          vb := @L.Stack[base + ins^.B];
-          vc := GetRK(L, base, kk, ins^.C);
+          vb := @RB[(ip - 1)^.B];
+          vc := GetRKR(RB, kk, (ip - 1)^.C);
           vt := nil;
           if vc^.Vt = vtStr then
           begin
@@ -2510,122 +2602,84 @@ begin
           end;
           if vt <> nil then
           begin
-            CopyVal(@L.Stack[base + ins^.A + 1], vb);
-            CopyVal(@L.Stack[base + ins^.A], vt);
+            CopyVal(@RB[(ip - 1)^.A + 1], vb);
+            CopyVal(@RB[(ip - 1)^.A], vt);
           end
-          else ip := code + ExecOther(L, ci, f, kk, base, (ip - code) - 1);
+          else VMX_XO;
         end;
         OP_ADD: begin
-          vb := GetRK(L, base, kk, ins^.B);
-          vc := GetRK(L, base, kk, ins^.C);
-          if vb^.Vt = vtInt then
-          begin
-            if vc^.Vt = vtInt then SetIntV(@L.Stack[base + ins^.A], Int64(QWord(vb^.I) + QWord(vc^.I)))
-            else if vc^.Vt = vtFlt then SetFltV(@L.Stack[base + ins^.A], vb^.I + vc^.N)
-            else ip := code + ExecOther(L, ci, f, kk, base, (ip - code) - 1);
-          end
-          else if vb^.Vt = vtFlt then
-          begin
-            if vc^.Vt = vtFlt then SetFltV(@L.Stack[base + ins^.A], vb^.N + vc^.N)
-            else if vc^.Vt = vtInt then SetFltV(@L.Stack[base + ins^.A], vb^.N + vc^.I)
-            else ip := code + ExecOther(L, ci, f, kk, base, (ip - code) - 1);
-          end
-          else ip := code + ExecOther(L, ci, f, kk, base, (ip - code) - 1);
+          if not FastAdd(@RB[(ip - 1)^.A], GetRKR(RB, kk, (ip - 1)^.B), GetRKR(RB, kk, (ip - 1)^.C)) then VMX_XO;
         end;
         OP_SUB: begin
-          vb := GetRK(L, base, kk, ins^.B);
-          vc := GetRK(L, base, kk, ins^.C);
-          if vb^.Vt = vtInt then
-          begin
-            if vc^.Vt = vtInt then SetIntV(@L.Stack[base + ins^.A], Int64(QWord(vb^.I) - QWord(vc^.I)))
-            else if vc^.Vt = vtFlt then SetFltV(@L.Stack[base + ins^.A], vb^.I - vc^.N)
-            else ip := code + ExecOther(L, ci, f, kk, base, (ip - code) - 1);
-          end
-          else if vb^.Vt = vtFlt then
-          begin
-            if vc^.Vt = vtFlt then SetFltV(@L.Stack[base + ins^.A], vb^.N - vc^.N)
-            else if vc^.Vt = vtInt then SetFltV(@L.Stack[base + ins^.A], vb^.N - vc^.I)
-            else ip := code + ExecOther(L, ci, f, kk, base, (ip - code) - 1);
-          end
-          else ip := code + ExecOther(L, ci, f, kk, base, (ip - code) - 1);
+          if not FastSub(@RB[(ip - 1)^.A], GetRKR(RB, kk, (ip - 1)^.B), GetRKR(RB, kk, (ip - 1)^.C)) then VMX_XO;
         end;
         OP_MUL: begin
-          vb := GetRK(L, base, kk, ins^.B);
-          vc := GetRK(L, base, kk, ins^.C);
-          if vb^.Vt = vtInt then
-          begin
-            if vc^.Vt = vtInt then SetIntV(@L.Stack[base + ins^.A], Int64(QWord(vb^.I) * QWord(vc^.I)))
-            else if vc^.Vt = vtFlt then SetFltV(@L.Stack[base + ins^.A], vb^.I * vc^.N)
-            else ip := code + ExecOther(L, ci, f, kk, base, (ip - code) - 1);
-          end
-          else if vb^.Vt = vtFlt then
-          begin
-            if vc^.Vt = vtFlt then SetFltV(@L.Stack[base + ins^.A], vb^.N * vc^.N)
-            else if vc^.Vt = vtInt then SetFltV(@L.Stack[base + ins^.A], vb^.N * vc^.I)
-            else ip := code + ExecOther(L, ci, f, kk, base, (ip - code) - 1);
-          end
-          else ip := code + ExecOther(L, ci, f, kk, base, (ip - code) - 1);
+          if not FastMul(@RB[(ip - 1)^.A], GetRKR(RB, kk, (ip - 1)^.B), GetRKR(RB, kk, (ip - 1)^.C)) then VMX_XO;
         end;
         OP_DIV: begin
-          vb := GetRK(L, base, kk, ins^.B);
-          vc := GetRK(L, base, kk, ins^.C);
-          if (vb^.Vt = vtFlt) and (vc^.Vt = vtFlt) then SetFltV(@L.Stack[base + ins^.A], vb^.N / vc^.N)
-          else ip := code + ExecOther(L, ci, f, kk, base, (ip - code) - 1);
+          vb := GetRKR(RB, kk, (ip - 1)^.B);
+          vc := GetRKR(RB, kk, (ip - 1)^.C);
+          if (vb^.Vt = vtFlt) and (vc^.Vt = vtFlt) then SetFltV(@RB[(ip - 1)^.A], vb^.N / vc^.N)
+          else VMX_XO;
         end;
         OP_MOD: begin
-          vb := GetRK(L, base, kk, ins^.B);
-          vc := GetRK(L, base, kk, ins^.C);
+          vb := GetRKR(RB, kk, (ip - 1)^.B);
+          vc := GetRKR(RB, kk, (ip - 1)^.C);
           if (vb^.Vt = vtInt) and (vc^.Vt = vtInt) and (vc^.I > 0) then
           begin
             // positive modulus: the result takes the sign of the divisor
             step := vb^.I mod vc^.I;
             if step < 0 then step := step + vc^.I;
-            SetIntV(@L.Stack[base + ins^.A], step);
+            SetIntV(@RB[(ip - 1)^.A], step);
           end
-          else ip := code + ExecOther(L, ci, f, kk, base, (ip - code) - 1);
+          else VMX_XO;
         end;
         OP_IDIV: begin
-          vb := GetRK(L, base, kk, ins^.B);
-          vc := GetRK(L, base, kk, ins^.C);
+          vb := GetRKR(RB, kk, (ip - 1)^.B);
+          vc := GetRKR(RB, kk, (ip - 1)^.C);
           if (vb^.Vt = vtInt) and (vc^.Vt = vtInt) and (vc^.I > 0) then
           begin
             step := vb^.I div vc^.I;
             if (vb^.I mod vc^.I) < 0 then Dec(step);
-            SetIntV(@L.Stack[base + ins^.A], step);
+            SetIntV(@RB[(ip - 1)^.A], step);
           end
-          else ip := code + ExecOther(L, ci, f, kk, base, (ip - code) - 1);
+          else VMX_XO;
         end;
         OP_UNM: begin
-          vb := @L.Stack[base + ins^.B];
-          if vb^.Vt = vtInt then SetIntV(@L.Stack[base + ins^.A], Int64(QWord(0) - QWord(vb^.I)))
-          else if vb^.Vt = vtFlt then SetFltV(@L.Stack[base + ins^.A], -vb^.N)
-          else ip := code + ExecOther(L, ci, f, kk, base, (ip - code) - 1);
+          vb := @RB[(ip - 1)^.B];
+          if vb^.Vt = vtInt then SetIntV(@RB[(ip - 1)^.A], Int64(QWord(0) - QWord(vb^.I)))
+          else if vb^.Vt = vtFlt then SetFltV(@RB[(ip - 1)^.A], -vb^.N)
+          else VMX_XO;
         end;
-        OP_NOT: SetBoolV(@L.Stack[base + ins^.A], IsFalse(L.Stack[base + ins^.B]));
+        OP_NOT: begin
+          SetBoolV(@RB[(ip - 1)^.A], IsFalse(RB[(ip - 1)^.B]));
+        end;
         OP_LEN: begin
-          vb := @L.Stack[base + ins^.B];
-          if vb^.Vt = vtStr then SetIntV(@L.Stack[base + ins^.A], vb^.S.Len)
+          vb := @RB[(ip - 1)^.B];
+          if vb^.Vt = vtStr then SetIntV(@RB[(ip - 1)^.A], vb^.S.Len)
           else if (vb^.Vt = vtTab) and (vb^.T.Metatable = nil) then
-            SetIntV(@L.Stack[base + ins^.A], TableLength(vb^.T))
-          else ip := code + ExecOther(L, ci, f, kk, base, (ip - code) - 1);
+            SetIntV(@RB[(ip - 1)^.A], TableLength(vb^.T))
+          else VMX_XO;
         end;
-        OP_JMP: ip := code + ins^.A;
+        OP_JMP: begin
+          ip := code + (ip - 1)^.A;
+        end;
         OP_JT: begin
-          vb := @L.Stack[base + ins^.A];
-          if (vb^.Vt <> vtNil) and ((vb^.Vt <> vtBool) or (vb^.B)) then ip := code + ins^.B;
+          vb := @RB[(ip - 1)^.A];
+          if (vb^.Vt <> vtNil) and ((vb^.Vt <> vtBool) or (vb^.B)) then ip := code + (ip - 1)^.B;
         end;
         OP_JF: begin
-          vb := @L.Stack[base + ins^.A];
-          if (vb^.Vt = vtNil) or ((vb^.Vt = vtBool) and (not vb^.B)) then ip := code + ins^.B;
+          vb := @RB[(ip - 1)^.A];
+          if (vb^.Vt = vtNil) or ((vb^.Vt = vtBool) and (not vb^.B)) then ip := code + (ip - 1)^.B;
         end;
         OP_EQ: begin
-          vb := GetRK(L, base, kk, ins^.B);
-          vc := GetRK(L, base, kk, ins^.C);
+          vb := GetRKR(RB, kk, (ip - 1)^.B);
+          vc := GetRKR(RB, kk, (ip - 1)^.C);
           if vb^.Vt <> vc^.Vt then
           begin
             if ((vb^.Vt = vtInt) and (vc^.Vt = vtFlt)) or ((vb^.Vt = vtFlt) and (vc^.Vt = vtInt)) then
-              ip := code + ExecOther(L, ci, f, kk, base, (ip - code) - 1)
-            else if (ins^.A <> 0) then Inc(ip)
+              VMX_XO
+            else if ((ip - 1)^.A <> 0) then Inc(ip)
             else ip := code + ip^.A;
           end
           else
@@ -2642,53 +2696,47 @@ begin
               if not cond then
               begin
                 // tables and userdata of different identity may still have __eq
-                ip := code + ExecOther(L, ci, f, kk, base, (ip - code) - 1);
+                VMX_XO;
                 continue;
               end;
             end;
-            if cond = (ins^.A <> 0) then ip := code + ip^.A else Inc(ip);
+            if cond = ((ip - 1)^.A <> 0) then ip := code + ip^.A else Inc(ip);
           end;
         end;
         OP_LT: begin
-          vb := GetRK(L, base, kk, ins^.B);
-          vc := GetRK(L, base, kk, ins^.C);
-          if (vb^.Vt = vtInt) and (vc^.Vt = vtInt) then
-          begin
-            if (vb^.I < vc^.I) = (ins^.A <> 0) then ip := code + ip^.A else Inc(ip);
-          end
-          else if (vb^.Vt = vtFlt) and (vc^.Vt = vtFlt) then
-          begin
-            if (vb^.N < vc^.N) = (ins^.A <> 0) then ip := code + ip^.A else Inc(ip);
-          end
-          else if (vb^.Vt = vtStr) and (vc^.Vt = vtStr) then
-          begin
-            if (StrCompareP(PChar(vb^.S.Data), vb^.S.Len, PChar(vc^.S.Data), vc^.S.Len) < 0) = (ins^.A <> 0) then
-              ip := code + ip^.A
-            else Inc(ip);
-          end
-          else ip := code + ExecOther(L, ci, f, kk, base, (ip - code) - 1);
+          vb := GetRKR(RB, kk, (ip - 1)^.B);
+          vc := GetRKR(RB, kk, (ip - 1)^.C);
+          case FastLT(vb, vc) of
+            0: if (ip - 1)^.A = 0 then ip := code + ip^.A else Inc(ip);
+            1: if (ip - 1)^.A <> 0 then ip := code + ip^.A else Inc(ip);
+          else
+            if (vb^.Vt = vtStr) and (vc^.Vt = vtStr) then
+            begin
+              if (StrCompareP(PChar(vb^.S.Data), vb^.S.Len, PChar(vc^.S.Data), vc^.S.Len) < 0) = ((ip - 1)^.A <> 0) then
+                ip := code + ip^.A
+              else Inc(ip);
+            end
+            else VMX_XO;
+          end;
         end;
         OP_LE: begin
-          vb := GetRK(L, base, kk, ins^.B);
-          vc := GetRK(L, base, kk, ins^.C);
-          if (vb^.Vt = vtInt) and (vc^.Vt = vtInt) then
-          begin
-            if (vb^.I <= vc^.I) = (ins^.A <> 0) then ip := code + ip^.A else Inc(ip);
-          end
-          else if (vb^.Vt = vtFlt) and (vc^.Vt = vtFlt) then
-          begin
-            if (vb^.N <= vc^.N) = (ins^.A <> 0) then ip := code + ip^.A else Inc(ip);
-          end
-          else if (vb^.Vt = vtStr) and (vc^.Vt = vtStr) then
-          begin
-            if (StrCompareP(PChar(vb^.S.Data), vb^.S.Len, PChar(vc^.S.Data), vc^.S.Len) <= 0) = (ins^.A <> 0) then
-              ip := code + ip^.A
-            else Inc(ip);
-          end
-          else ip := code + ExecOther(L, ci, f, kk, base, (ip - code) - 1);
+          vb := GetRKR(RB, kk, (ip - 1)^.B);
+          vc := GetRKR(RB, kk, (ip - 1)^.C);
+          case FastLE(vb, vc) of
+            0: if (ip - 1)^.A = 0 then ip := code + ip^.A else Inc(ip);
+            1: if (ip - 1)^.A <> 0 then ip := code + ip^.A else Inc(ip);
+          else
+            if (vb^.Vt = vtStr) and (vc^.Vt = vtStr) then
+            begin
+              if (StrCompareP(PChar(vb^.S.Data), vb^.S.Len, PChar(vc^.S.Data), vc^.S.Len) <= 0) = ((ip - 1)^.A <> 0) then
+                ip := code + ip^.A
+              else Inc(ip);
+            end
+            else VMX_XO;
+          end;
         end;
         OP_FORLOOP: begin
-          vb := @L.Stack[base + ins^.A];
+          vb := @RB[(ip - 1)^.A];
           vc := vb + 1;
           vt := vb + 2;
           if vc^.Vt = vtInt then
@@ -2698,7 +2746,7 @@ begin
             begin
               SetIntV(vb, Int64(cnt - 1));
               SetIntV(vt, Int64(QWord(vt^.I) + QWord(vc^.I)));
-              ip := code + ins^.B;
+              ip := code + (ip - 1)^.B;
             end;
           end
           else
@@ -2708,70 +2756,131 @@ begin
             if cond then
             begin
               SetFltV(vt, fidx);
-              ip := code + ins^.B;
+              ip := code + (ip - 1)^.B;
             end;
           end;
         end;
         OP_TFORLOOP: begin
-          if L.Stack[base + ins^.A + 3].Vt <> vtNil then ip := code + ins^.B;
+          if RB[(ip - 1)^.A + 3].Vt <> vtNil then ip := code + (ip - 1)^.B;
         end;
         OP_TFORCALL: begin
-          ci^.SavedPC := ip - code;
-          funcIdx := base + ins^.A;
+          ci^.SavedPC := PCOf(ip, code);
+          funcIdx := base + (ip - 1)^.A;
           CopyVal(@L.Stack[funcIdx + 5], @L.Stack[funcIdx + 3]);
           CopyVal(@L.Stack[funcIdx + 4], @L.Stack[funcIdx + 1]);
           CopyVal(@L.Stack[funcIdx + 3], @L.Stack[funcIdx]);
           L.Top := funcIdx + 6;
           funcIdx := funcIdx + 3;
           nargs := 2;
-          if L.Stack[funcIdx].Vt <> vtFunc then TryFuncTM(L, funcIdx, nargs);
+          if L.Stack[funcIdx].Vt <> vtFunc then TryFuncTM(L, funcIdx, nargs); RB := @L.Stack[base];
           nf := L.Stack[funcIdx].F;
           if not nf.IsC then
           begin
             // Lua iterator: a new frame in this loop
-            EnterLuaFrame(L, nf, funcIdx, nargs, ins^.C);
+            EnterLuaFrame(L, nf, funcIdx, nargs, (ip - 1)^.C);
             Break;
           end;
-          CallC(L, nf, funcIdx, nargs, ins^.C);
+          CallC(L, nf, funcIdx, nargs, (ip - 1)^.C); RB := @L.Stack[base];
           L.Top := ci^.Top;
         end;
         OP_NEWTABLE: begin
-          ci^.SavedPC := ip - code;
-          vt := @L.Stack[base + ins^.A];
-          vt^.T := L.Main.NewTable(ins^.B, ins^.C);
+          ci^.SavedPC := PCOf(ip, code);
+          vt := @RB[(ip - 1)^.A];
+          vt^.T := L.Main.NewTable((ip - 1)^.B, (ip - 1)^.C);
           vt^.Vt := vtTab;
           if L.Main.TotalBytes >= L.Main.GCThreshold then
           begin
             // the new table is the topmost live register: everything above is dead
-            L.GCLimit := base + ins^.A + 1;
-            GCCheck(L, L.NCI - 1);
+            L.GCLimit := base + (ip - 1)^.A + 1;
+            GCCheck(L, L.NCI - 1); RB := @L.Stack[base];
             L.GCLimit := 0;
           end;
         end;
-        OP_CALL, OP_TAILCALL: begin
-          ci^.SavedPC := ip - code;
-          funcIdx := base + ins^.A;
-          if ins^.B <> 0 then
+        OP_CALL: begin
+          ci^.SavedPC := PCOf(ip, code);
+          funcIdx := base + (ip - 1)^.A;
+          if (ip - 1)^.B <> 0 then
           begin
-            nargs := ins^.B - 1;
+            nargs := (ip - 1)^.B - 1;
             L.Top := funcIdx + 1 + nargs;
           end
           else
             nargs := L.Top - funcIdx - 1;
-          nres := ins^.C - 1;
+          nres := (ip - 1)^.C - 1;
+          vb := @RB[(ip - 1)^.A];
+          if vb^.Vt <> vtFunc then
+          begin
+            TryFuncTM(L, funcIdx, nargs);
+            RB := @L.Stack[base];
+            vb := @RB[(ip - 1)^.A];
+          end;
+          nf := vb^.F;
+          if not nf.IsC then
+          begin
+            // Lua to Lua call: a new frame in this same loop, no native recursion
+            np := nf.Proto;
+            n := funcIdx + 1 + np.MaxStackSize;
+            if (not np.IsVararg) and (L.HookMask = 0) and (StackSlack = 0) and
+               (L.NCI < L.CILimit) and
+               (n + np.NumParams + nargs + LUA_MINSTACK + 2 <= L.FastLimit) then
+            begin
+              // fast path: switch to the new frame right here
+              for i := nargs to np.NumParams - 1 do L.Stack[funcIdx + 1 + i].Vt := vtNil;
+              L.Top := n;
+              Inc(ci);
+              ci^.Func := nf;
+              ci^.FuncIdx := funcIdx;
+              ci^.Base := funcIdx + 1;
+              ci^.Top := n;
+              ci^.NResults := nres;
+              ResetCI(ci);
+              Inc(L.NCI);
+              f := nf;
+              p := np;
+              code := PInstruction(p.Code);
+              kk := PLuaValue(p.K);
+              base := funcIdx + 1;
+              RB := @L.Stack[base];
+              ip := code;
+              continue;
+            end;
+            EnterLuaFrame(L, nf, funcIdx, nargs, nres);
+            Break;
+          end;
+          CallC(L, nf, funcIdx, nargs, nres); RB := @L.Stack[base];
+          if nres >= 0 then L.Top := ci^.Top;
+          if L.Main.TotalBytes >= L.Main.GCThreshold then
+          begin
+            // after a call with fixed results only the registers up to the last result are live
+            if nres > 0 then L.GCLimit := base + (ip - 1)^.A + nres;
+            GCCheck(L, L.NCI - 1); RB := @L.Stack[base];
+            L.GCLimit := 0;
+          end;
+        end;
+        OP_TAILCALL: begin
+          ci^.SavedPC := PCOf(ip, code);
+          funcIdx := base + (ip - 1)^.A;
+          if (ip - 1)^.B <> 0 then
+          begin
+            nargs := (ip - 1)^.B - 1;
+            L.Top := funcIdx + 1 + nargs;
+          end
+          else
+            nargs := L.Top - funcIdx - 1;
+          nres := (ip - 1)^.C - 1;
           if L.Stack[funcIdx].Vt <> vtFunc then
           begin
-            if ins^.Op = OP_TAILCALL then
+            if (ip - 1)^.Op = OP_TAILCALL then
               nf := nil   // a callable object: ExecOther takes care of it
             else
             begin
-              TryFuncTM(L, funcIdx, nargs);
+              TryFuncTM(L, funcIdx, nargs); RB := @L.Stack[base];
               nf := L.Stack[funcIdx].F;
             end;
           end
           else
             nf := L.Stack[funcIdx].F;
-          if (ins^.Op = OP_TAILCALL) and ((nf = nil) or (not nf.IsC)) then
+          if ((ip - 1)^.Op = OP_TAILCALL) and ((nf = nil) or (not nf.IsC)) then
           begin
             // tail call of a Lua function: the current frame is replaced
             if nf <> nil then
@@ -2782,8 +2891,7 @@ begin
             if (nf <> nil) and (not np.IsVararg) and (L.HookMask = 0) and (StackSlack = 0) and
                ((L.OpenUpvals = nil) or (L.OpenUpvals.Idx < base)) and
                ((L.NTbc = 0) or (L.TbcList[L.NTbc - 1] < base)) and
-               (n + np.NumParams + nargs + LUA_MINSTACK + 2 <= L.StackSize) and
-               (n + np.NumParams + nargs + LUA_MINSTACK + 2 <= MAXSTACK) then
+               (n + np.NumParams + nargs + LUA_MINSTACK + 2 <= L.FastLimit) then
             begin
               first := ci^.FuncIdx;
               for i := 0 to nargs do CopyVal(@L.Stack[first + i], @L.Stack[funcIdx + i]);
@@ -2799,14 +2907,16 @@ begin
               PendingExtra := 0;
               f := nf;
               p := np;
-              code := @p.Code[0];
-              if Length(p.K) > 0 then kk := @p.K[0] else kk := nil;
+              code := PInstruction(p.Code);
+              kk := PLuaValue(p.K);
               base := first + 1;
+              RB := @L.Stack[base];
               ip := code;
               continue;
             end;
             // the general case (upvalues to close, hooks, vararg callee, __call...)
-            r := ExecOther(L, ci, f, kk, base, (ip - code) - 1);
+            r := ExecOther(L, ci, f, kk, base, PCOf(ip, code) - 1);
+            RB := @L.Stack[base];
             case r of
               EXEC_EXIT: Exit;
               EXEC_RELOAD: begin returning := False; Break; end;
@@ -2821,8 +2931,7 @@ begin
             n := funcIdx + 1 + np.MaxStackSize;
             if (not np.IsVararg) and (L.HookMask = 0) and (StackSlack = 0) and
                (L.NCI < ThreadMaxCI(L)) and
-               (n + np.NumParams + nargs + LUA_MINSTACK + 2 <= L.StackSize) and
-               (n + np.NumParams + nargs + LUA_MINSTACK + 2 <= MAXSTACK) then
+               (n + np.NumParams + nargs + LUA_MINSTACK + 2 <= L.FastLimit) then
             begin
               // fast path: switch to the new frame right here
               for i := nargs to np.NumParams - 1 do L.Stack[funcIdx + 1 + i].Vt := vtNil;
@@ -2832,37 +2941,28 @@ begin
               ci^.FuncIdx := funcIdx;
               ci^.Base := funcIdx + 1;
               ci^.Top := n;
-              ci^.SavedPC := 0;
               ci^.NResults := nres;
-              ci^.NExtra := 0;
-              ci^.IsC := False;
-              ci^.IsTail := False;
-              ci^.Hooked := False;
-              ci^.Fresh := False;
-              ci^.InFinalizer := False;
-              ci^.FTransfer := 0;
-              ci^.NTransfer := 0;
-              ci^.ExtraArgs := PendingExtra;
-              PendingExtra := 0;
+              ResetCI(ci);
               Inc(L.NCI);
               f := nf;
               p := np;
-              code := @p.Code[0];
-              if Length(p.K) > 0 then kk := @p.K[0] else kk := nil;
+              code := PInstruction(p.Code);
+              kk := PLuaValue(p.K);
               base := funcIdx + 1;
+              RB := @L.Stack[base];
               ip := code;
               continue;
             end;
             EnterLuaFrame(L, nf, funcIdx, nargs, nres);
             Break;
           end;
-          CallC(L, nf, funcIdx, nargs, nres);
+          CallC(L, nf, funcIdx, nargs, nres); RB := @L.Stack[base];
           if nres >= 0 then L.Top := ci^.Top;
           if L.Main.TotalBytes >= L.Main.GCThreshold then
           begin
             // after a call with fixed results only the registers up to the last result are live
-            if nres > 0 then L.GCLimit := base + ins^.A + nres;
-            GCCheck(L, L.NCI - 1);
+            if nres > 0 then L.GCLimit := base + (ip - 1)^.A + nres;
+            GCCheck(L, L.NCI - 1); RB := @L.Stack[base];
             L.GCLimit := 0;
           end;
         end;
@@ -2870,7 +2970,8 @@ begin
           if ((L.OpenUpvals <> nil) and (L.OpenUpvals.Idx >= base)) or
              ((L.NTbc > 0) and (L.TbcList[L.NTbc - 1] >= base)) or (L.HookMask <> 0) then
           begin
-            r := ExecOther(L, ci, f, kk, base, (ip - code) - 1);
+            r := ExecOther(L, ci, f, kk, base, PCOf(ip, code) - 1);
+            RB := @L.Stack[base];
             case r of
               EXEC_EXIT: Exit;
               EXEC_RELOAD: begin returning := False; Break; end;
@@ -2881,8 +2982,8 @@ begin
           end
           else
           begin
-            first := base + ins^.A;
-            if ins^.B <> 0 then n := ins^.B - 1 else n := L.Top - first;
+            first := base + (ip - 1)^.A;
+            if (ip - 1)^.B <> 0 then n := (ip - 1)^.B - 1 else n := L.Top - first;
             nres := ci^.NResults;
             funcIdx := ci^.FuncIdx;
             if nres = 1 then
@@ -2895,29 +2996,31 @@ begin
             else PostCall(L, funcIdx, first, n, nres);
             if ci^.Fresh then Exit;
             // return into the calling Lua frame (same loop)
-            retNres := nres;
             Dec(L.NCI);
             if L.HookMask = 0 then
             begin
               Dec(ci);
               f := ci^.Func;
               p := f.Proto;
-              code := @p.Code[0];
-              if Length(p.K) > 0 then kk := @p.K[0] else kk := nil;
+              code := PInstruction(p.Code);
+              kk := PLuaValue(p.K);
               base := ci^.Base;
+              RB := @L.Stack[base];
               ip := code + ci^.SavedPC;
               if nres >= 0 then L.Top := ci^.Top;
             end
             else
             begin
+              retNres := nres;
               returning := True;
               Break;
             end;
           end;
         end;
-      else
+      OP_SETTABUP, OP_POW, OP_BAND, OP_BOR, OP_BXOR, OP_SHL, OP_SHR, OP_BNOT, OP_CONCAT, OP_VARARG, OP_CLOSURE, OP_SETLIST, OP_CLOSE, OP_TBC, OP_FORPREP, OP_TFORPREP, OP_ERRNNIL, OP_NOP, OP_GETVARG, NUM_OPCODES..255:
         begin
-          r := ExecOther(L, ci, f, kk, base, (ip - code) - 1);
+          r := ExecOther(L, ci, f, kk, base, PCOf(ip, code) - 1);
+            RB := @L.Stack[base];
           if r >= 0 then ip := code + r
           else case r of
             EXEC_EXIT: Exit;
@@ -2930,6 +3033,8 @@ begin
     end;
   end;
 end;
+
+{$undef VMX_XO}
 
 { ===================================================================== }
 { protected calls, finalizers                                            }

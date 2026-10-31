@@ -191,17 +191,20 @@ type
     FuncIdx: Integer;     // stack slot of the function; results go there
     Base: Integer;        // first register / first argument
     Top: Integer;         // frame limit
-    SavedPC: Integer;     // index of the next instruction
     NResults: Integer;
-    NExtra: Integer;      // number of hidden vararg values (below Base)
-    IsC: Boolean;
-    IsTail: Boolean;
-    Hooked: Boolean;      // a hook function is running on behalf of this frame
-    Fresh: Boolean;       // entered from native code (DoCall): its return leaves VMExecute
-    InFinalizer: Boolean; // a __gc finalizer is running on top of this frame
-    FTransfer: Integer;   // values transferred by a call/return event (valid inside the hook)
-    NTransfer: Integer;
-    ExtraArgs: Integer;   // callable objects (__call) prepended to the arguments
+    // everything below starts as zero/False in a new frame: 'Zero' clears it with three stores
+    case Byte of
+      0: (SavedPC: Integer;     // index of the next instruction
+          NExtra: Integer;      // number of hidden vararg values (below Base)
+          FTransfer: Integer;   // values transferred by a call/return event (valid inside the hook)
+          NTransfer: Integer;
+          ExtraArgs: Byte;      // callable objects (__call) prepended to the arguments (< 16)
+          IsC: Boolean;
+          IsTail: Boolean;
+          Hooked: Boolean;      // a hook function is running on behalf of this frame
+          Fresh: Boolean;       // entered from native code (DoCall): its return leaves VMExecute
+          InFinalizer: Boolean);// a __gc finalizer is running on top of this frame
+      1: (Zero: array[0..2] of QWord);
   end;
 
   TThread = class(TGCObject)
@@ -209,6 +212,8 @@ type
     Main: TLua;
     Stack: PLuaValue;       // value stack (a plain memory block, zero filled = nil)
     StackSize: Integer;
+    FastLimit: Integer;     // min(StackSize, MAXSTACK): frames fitting below it need no stack check
+    CILimit: Integer;       // maximum call depth of this thread
     Top: Integer;
     CI: PCallInfo;          // call infos: allocated once at the maximum depth, never moved
     CISize: Integer;
@@ -1300,6 +1305,8 @@ begin
   ReallocMem(Stack, ns * SizeOf(TLuaValue));
   FillChar(Stack[StackSize], (ns - StackSize) * SizeOf(TLuaValue), 0);   // new slots are nil
   StackSize := ns;
+  FastLimit := StackSize;
+  if FastLimit > MAXSTACK then FastLimit := MAXSTACK;
   // the block may have moved: open upvalues point into it
   u := OpenUpvals;
   while u <> nil do
@@ -1932,6 +1939,8 @@ begin
   TheState := Self;
   CurThread := Self;
   StackSize := 256;
+  FastLimit := StackSize;
+  CILimit := CI_CAPACITY_MAIN - 512;
   Stack := AllocMem(StackSize * SizeOf(TLuaValue));
   CISize := CI_CAPACITY_MAIN;
   CI := GetMem(CISize * SizeOf(TCallInfo));   // never reallocated: the VM keeps pointers into it
@@ -1957,6 +1966,8 @@ begin
   ObjType := OBJ_THREAD;
   Main := AMain;
   StackSize := 64;
+  FastLimit := StackSize;
+  CILimit := CI_CAPACITY_CO - 512;
   Stack := AllocMem(StackSize * SizeOf(TLuaValue));
   CISize := CI_CAPACITY_CO;
   CI := GetMem(CISize * SizeOf(TCallInfo));
