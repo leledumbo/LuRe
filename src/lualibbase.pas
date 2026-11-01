@@ -48,7 +48,6 @@ end;
 var
   WarnOn: Boolean = False;
   WarnCont: Boolean = False;
-  WarnCtl: Boolean = False;   // first piece of a message was a control message
 
 procedure WarnMessage(L: TLua; const msg: RawByteString; tocont: Boolean);
 var
@@ -64,7 +63,6 @@ begin
   if not WarnOn then
   begin
     WarnCont := tocont;
-    WarnCtl := False;
     Exit;
   end;
   if not WarnCont then
@@ -530,7 +528,7 @@ end;
 function luaB_load(L: TLua): Integer;
 var
   v: TLuaValue;
-  chunk, src: RawByteString;
+  src: RawByteString;
   name, mode, err: string;
   f: TFunction;
   piece: TLuaValue;

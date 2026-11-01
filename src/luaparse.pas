@@ -20,7 +20,7 @@ function LuaUndump(L: TLua; const data: RawByteString; const name: string): TFun
 implementation
 
 uses
-  SysUtils, Contnrs, luaast, luaparser, luagen, luabinary;
+  SysUtils, luaast, luaparser, luagen, luabinary;
 
 function LuaCompile(L: TLua; const source: RawByteString; const name: string): TFunction;
 var

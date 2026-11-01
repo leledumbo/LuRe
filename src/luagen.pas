@@ -12,7 +12,7 @@ unit luagen;
 interface
 
 uses
-  SysUtils, Generics.Collections, luacore, luaast;
+  SysUtils, luacore, luaast;
 
 function GenerateProto(L: TLua; decl: TFuncDecl; const chunkId: string;
                        source: TStringObj): TProto;

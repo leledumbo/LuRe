@@ -8,7 +8,7 @@ unit lualibdbg;
 interface
 
 uses
-  SysUtils, Math, luacore, luavm, luaaux, lualibbase;
+  SysUtils, luacore, luavm, luaaux, lualibbase;
 
 procedure OpenDebug(L: TLua);
 

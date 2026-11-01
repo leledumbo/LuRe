@@ -6,7 +6,7 @@ program lua;
 
 uses
   {$ifdef unix}cthreads,{$endif}
-  SysUtils, Classes, Math, luacore, luavm, luaaux, luaparse, lualibbase, lualibos,
+  SysUtils, Classes, Math, luacore, luavm, luaaux, lualibbase, lualibos,
   lualibdbg, lualib;
 
 function c_isatty(fd: Integer): Integer; cdecl; external 'c' name 'isatty';
@@ -307,7 +307,7 @@ var
   line, full: RawByteString;
   f: TFunction;
   err: string;
-  status, i: Integer;
+  status: Integer;
   oldname: string;
   incomplete, loaded: Boolean;
   n, base: Integer;

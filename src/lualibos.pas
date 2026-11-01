@@ -8,7 +8,7 @@ unit lualibos;
 interface
 
 uses
-  SysUtils, Math, luacore, luavm, luaaux, lualibbase;
+  SysUtils, luacore, luavm, luaaux, lualibbase;
 
 type
   TCloseStateProc = procedure(L: TLua);

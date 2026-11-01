@@ -9,7 +9,7 @@ unit luaparser;
 interface
 
 uses
-  SysUtils, Math, Contnrs, luacore, lualex, luaast, luaarith;
+  SysUtils, Math, luacore, lualex, luaast, luaarith;
 
 // Parses a chunk. 'owner' receives every node created (the caller frees it
 // after code generation).
@@ -172,7 +172,7 @@ type
     procedure ForStat(blk: TBlock; line: Integer);
     procedure ForNum(s: TStmt; varname: TStringObj; line: Integer);
     procedure ForList(s: TStmt; indexname: TStringObj; line: Integer);
-    procedure ForBody(s: TStmt; line: Integer);
+    procedure ForBody(s: TStmt);
     procedure FuncStat(blk: TBlock; line: Integer);
     procedure LocalFunc(blk: TBlock; line: Integer);
     procedure LocalStat(blk: TBlock; line: Integer);
@@ -1376,7 +1376,7 @@ begin
   AddStmt(blk, s);
 end;
 
-procedure TParser.ForBody(s: TStmt; line: Integer);
+procedure TParser.ForBody(s: TStmt);
 var
   bl: TBlockScope;
   i: Integer;
@@ -1418,7 +1418,7 @@ begin
   SetLength(s.Vars, 1);
   s.Vars[0] := cv;
   s.EndLine := line;
-  ForBody(s, line);
+  ForBody(s);
 end;
 
 procedure TParser.ForList(s: TStmt; indexname: TStringObj; line: Integer);
@@ -1451,7 +1451,7 @@ begin
   s.Hidden[1] := h2;
   s.Hidden[2] := h3;
   CurBlock^.InsideTbc := True;   // the closing value is to-be-closed
-  ForBody(s, line);
+  ForBody(s);
 end;
 
 procedure TParser.ForStat(blk: TBlock; line: Integer);

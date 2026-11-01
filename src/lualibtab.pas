@@ -8,7 +8,7 @@ unit lualibtab;
 interface
 
 uses
-  SysUtils, Math, luacore, luavm, luaaux;
+  SysUtils, luacore, luavm, luaaux;
 
 procedure OpenTable(L: TLua);
 

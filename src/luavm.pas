@@ -1653,14 +1653,14 @@ begin
 end;
 
 // arithmetic that is not a plain int/float case: coercions, metamethods, errors
-procedure ArithGeneric(L: TLua; cidx, base: Integer; kk: PLuaValue; ins: PInstruction; pc: Integer);
+procedure ArithGeneric(L: TLua; base: Integer; kk: PLuaValue; ins: PInstruction; pc: Integer);
 var
   vb, vc: PLuaValue;
   st: TArithResult;
   res, v, key: TLuaValue;
   B, C: Integer;
 begin
-  L.CI[cidx].SavedPC := pc;
+  L.CI[L.NCI - 1].SavedPC := pc;
   B := ins^.B;
   C := ins^.C;
   vb := GetRK(L, base, kk, B);
@@ -1863,16 +1863,13 @@ var
   newt: TTable;
   ra: Integer;
   v, key, res, tmp: TLuaValue;
-  st: TArithResult;
-  up: TUpval;
   np: TProto;
   nf: TFunction;
   tbl: TTable;
   cnt: QWord;
-  step, idx, lim: Int64;
-  fstep, flim, fidx: Double;
+  step: Int64;
+  fidx: Double;
   cond: Boolean;
-  nbase, nx: Integer;
 begin
   cidx := L.NCI - 1;
   p := f.Proto;
@@ -2021,7 +2018,7 @@ begin
           if vc^.Vt = vtFlt then begin SetFltV(@L.Stack[base + A], vb^.N + vc^.N); begin Result := pc; Exit; end; end;
           if vc^.Vt = vtInt then begin SetFltV(@L.Stack[base + A], vb^.N + vc^.I); begin Result := pc; Exit; end; end;
         end;
-        ArithGeneric(L, cidx, base, kk, ins, pc);
+        ArithGeneric(L, base, kk, ins, pc);
       end;
       OP_SUB: begin
         vb := GetRK(L, base, kk, B);
@@ -2036,7 +2033,7 @@ begin
           if vc^.Vt = vtFlt then begin SetFltV(@L.Stack[base + A], vb^.N - vc^.N); begin Result := pc; Exit; end; end;
           if vc^.Vt = vtInt then begin SetFltV(@L.Stack[base + A], vb^.N - vc^.I); begin Result := pc; Exit; end; end;
         end;
-        ArithGeneric(L, cidx, base, kk, ins, pc);
+        ArithGeneric(L, base, kk, ins, pc);
       end;
       OP_MUL: begin
         vb := GetRK(L, base, kk, B);
@@ -2051,7 +2048,7 @@ begin
           if vc^.Vt = vtFlt then begin SetFltV(@L.Stack[base + A], vb^.N * vc^.N); begin Result := pc; Exit; end; end;
           if vc^.Vt = vtInt then begin SetFltV(@L.Stack[base + A], vb^.N * vc^.I); begin Result := pc; Exit; end; end;
         end;
-        ArithGeneric(L, cidx, base, kk, ins, pc);
+        ArithGeneric(L, base, kk, ins, pc);
       end;
       OP_DIV: begin
         vb := GetRK(L, base, kk, B);
@@ -2061,7 +2058,7 @@ begin
           SetFltV(@L.Stack[base + A], vb^.N / vc^.N);
           begin Result := pc; Exit; end;
         end;
-        ArithGeneric(L, cidx, base, kk, ins, pc);
+        ArithGeneric(L, base, kk, ins, pc);
       end;
       OP_MOD: begin
         vb := GetRK(L, base, kk, B);
@@ -2074,7 +2071,7 @@ begin
           SetIntV(@L.Stack[base + A], step);
           begin Result := pc; Exit; end;
         end;
-        ArithGeneric(L, cidx, base, kk, ins, pc);
+        ArithGeneric(L, base, kk, ins, pc);
       end;
       OP_IDIV: begin
         vb := GetRK(L, base, kk, B);
@@ -2086,7 +2083,7 @@ begin
           SetIntV(@L.Stack[base + A], step);
           begin Result := pc; Exit; end;
         end;
-        ArithGeneric(L, cidx, base, kk, ins, pc);
+        ArithGeneric(L, base, kk, ins, pc);
       end;
       OP_POW, OP_BAND, OP_BOR, OP_BXOR, OP_SHL, OP_SHR: begin
         vb := GetRK(L, base, kk, B);
@@ -2101,7 +2098,7 @@ begin
           end;
           begin Result := pc; Exit; end;
         end;
-        ArithGeneric(L, cidx, base, kk, ins, pc);
+        ArithGeneric(L, base, kk, ins, pc);
       end;
       OP_UNM: begin
         vb := @L.Stack[base + B];
@@ -2472,6 +2469,8 @@ end;
 {$macro on}
 {$define VMX_XO := begin ip := code + ExecOther(L, ci, f, kk, base, PCOf(ip, code) - 1); RB := @L.Stack[base]; end}
 
+// Placement matters: with VMExecute at an unlucky address the loop bench is ~10% slower (see CLAUDE.local.md).
+{$codealign proc=64}
 // The interpreter loop. It keeps only the hot opcodes (with their fast paths) and
 // the frame switching of Lua-to-Lua calls; everything else is done by ExecOther.
 procedure VMExecute(L: TLua);
@@ -3035,6 +3034,7 @@ begin
 end;
 
 {$undef VMX_XO}
+{$codealign proc=16}
 
 { ===================================================================== }
 { protected calls, finalizers                                            }

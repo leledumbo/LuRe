@@ -1191,7 +1191,7 @@ end;
 function str_format(L: TLua): Integer;
 var
   top, arg, i: Integer;
-  fmt, b, tmp: RawByteString;
+  fmt, b: RawByteString;
   form, flags: string;
   conv: Char;
   n: Int64;

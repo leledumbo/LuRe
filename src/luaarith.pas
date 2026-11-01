@@ -9,7 +9,7 @@ unit luaarith;
 interface
 
 uses
-  SysUtils, Math, luacore;
+  SysUtils, luacore;
 
 type
   // result of an arithmetic operation on two numbers
