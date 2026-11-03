@@ -17,6 +17,7 @@ passing the test suite first instead of making the implementation right first.
 Everything is ready to use:
 * Standalone interpreter
 * Drop-in bindings (with p suffix, so luap instead of lua, lualibp instead of lualib, and lauxlibp instead of lauxlib)
+
 You can simply replace uses clause with these and say goodbye to Lua dynamic library to ship or static library to link with your application.
 The virtual machine implements the exact same bytecode instructions, so it's binary compatible with the original implementation.
 
