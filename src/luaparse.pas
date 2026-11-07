@@ -9,11 +9,12 @@ unit luaparse;
 interface
 
 uses
-  luacore;
+  luacore, lualex;
 
 // Compiles a source chunk. The first upvalue of the result (_ENV) is left
 // unset: the caller must assign it.
-function LuaCompile(L: TLua; const source: RawByteString; const name: string): TFunction;
+function LuaCompile(L: TLua; const source: RawByteString; const name: string;
+                    AReader: TLexReader = nil; AReaderData: Pointer = nil): TFunction;
 function LuaDump(L: TLua; f: TFunction; strip: Boolean): RawByteString;
 function LuaUndump(L: TLua; const data: RawByteString; const name: string): TFunction;
 
@@ -22,13 +23,14 @@ implementation
 uses
   SysUtils, luaast, luaparser, luagen, luabinary;
 
-function LuaCompile(L: TLua; const source: RawByteString; const name: string): TFunction;
+function LuaCompile(L: TLua; const source: RawByteString; const name: string;
+                    AReader: TLexReader; AReaderData: Pointer): TFunction;
 var
   decl: TFuncDecl;
   owner: TAstOwner;
   p: TProto;
 begin
-  decl := ParseChunk(L, source, name, owner);
+  decl := ParseChunk(L, source, name, owner, AReader, AReaderData);
   try
     p := GenerateProto(L, decl, ChunkIdStr(name), L.NewString(RawByteString(name)));
   finally

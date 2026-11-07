@@ -34,6 +34,10 @@ type
     First, Last: Integer;  // source range of the token text
   end;
 
+  // Gives the next piece of a chunk that is read through a function; False at the end of the chunk.
+  // Errors are raised as exceptions.
+  TLexReader = function(Data: Pointer; out piece: RawByteString): Boolean;
+
   TLexer = class
   public
     L: TLua;
@@ -46,7 +50,8 @@ type
     IntVal: Int64;
     FltVal: Double;
     NameStr: TStringObj;   // the current identifier (interned)
-    constructor Create(AL: TLua; const ASource: RawByteString; const AChunkId: string);
+    constructor Create(AL: TLua; const ASource: RawByteString; const AChunkId: string;
+                       AReader: TLexReader = nil; AReaderData: Pointer = nil);
     destructor Destroy; override;
     procedure Next;
     function LookAhead: TTokenKind;
@@ -61,9 +66,11 @@ type
     function NewStr(const s: RawByteString): TStringObj;
     function NameIs(const s: string): Boolean;   // is the current identifier 's'?
   private
-    Source: RawByteString;
+    Source: RawByteString;   // with a reader its length is only a capacity: Len counts the valid bytes
     Len: Integer;
     Pos: Integer;
+    Reader: TLexReader;      // chunk given piece by piece (load with a function), nil otherwise
+    ReaderData: Pointer;
     CurCh: Char;
     Buf: PByte;          // characters of the token being scanned
     BufLen, BufCap: Integer;
@@ -72,6 +79,8 @@ type
     HasAhead: Boolean;
     LongStrs: specialize TDictionary<RawByteString, TStringObj>;
     procedure Advance; inline;
+    function Refill: Boolean;
+    function BufferEnd: Char;
     procedure Save(c: Char); inline;
     procedure SaveAndNext; inline;
     function AtEof: Boolean; inline;
@@ -134,9 +143,12 @@ begin
   end;
 end;
 
-constructor TLexer.Create(AL: TLua; const ASource: RawByteString; const AChunkId: string);
+constructor TLexer.Create(AL: TLua; const ASource: RawByteString; const AChunkId: string;
+                          AReader: TLexReader; AReaderData: Pointer);
 begin
   L := AL;
+  Reader := AReader;
+  ReaderData := AReaderData;
   Source := ASource;
   Len := Length(ASource);
   ChunkId := AChunkId;
@@ -176,7 +188,31 @@ end;
 procedure TLexer.Advance;
 begin
   Inc(Pos);
-  if Pos <= Len then CurCh := Source[Pos] else CurCh := #0;
+  if Pos <= Len then CurCh := Source[Pos] else CurCh := BufferEnd;
+end;
+
+// Appends the next piece of a chunk read through a function. The current character is always
+// loaded eagerly (as in llex.c), so the reader is called exactly when the reference would.
+function TLexer.Refill: Boolean;
+var
+  piece: RawByteString;
+  n: Integer;
+begin
+  if not Reader(ReaderData, piece) then
+  begin
+    Reader := nil;   // exhausted: never called again
+    Exit(False);
+  end;
+  n := Length(piece);
+  if Len + n > Length(Source) then SetLength(Source, (Len + n) * 2);
+  Move(piece[1], Source[Len + 1], n);
+  Inc(Len, n);
+  Result := True;
+end;
+
+function TLexer.BufferEnd: Char;
+begin
+  if (Reader <> nil) and Refill then Result := Source[Pos] else Result := #0;
 end;
 
 function TLexer.AtEof: Boolean;
@@ -599,13 +635,18 @@ begin
   while True do
   begin
     // blanks are skipped in a tight loop on a local index
-    i := Pos;
-    while (i <= Len) and (Source[i] in [' ', #9, #11, #12]) do Inc(i);
-    if i <> Pos then
+    if Reader = nil then
     begin
-      Pos := i;
-      if i <= Len then CurCh := Source[i] else CurCh := #0;
-    end;
+      i := Pos;
+      while (i <= Len) and (Source[i] in [' ', #9, #11, #12]) do Inc(i);
+      if i <> Pos then
+      begin
+        Pos := i;
+        if i <= Len then CurCh := Source[i] else CurCh := #0;
+      end;
+    end
+    else
+      while CurCh in [' ', #9, #11, #12] do Advance;
     t.First := Pos;
     if AtEof then
     begin
@@ -731,10 +772,18 @@ begin
       'a'..'z', 'A'..'Z', '_':
         begin
           idStart := Pos;
-          i := Pos + 1;
-          while (i <= Len) and (Source[i] in ['a'..'z', 'A'..'Z', '_', '0'..'9']) do Inc(i);
-          Pos := i;
-          if i <= Len then CurCh := Source[i] else CurCh := #0;
+          if Reader = nil then
+          begin
+            i := Pos + 1;
+            while (i <= Len) and (Source[i] in ['a'..'z', 'A'..'Z', '_', '0'..'9']) do Inc(i);
+            Pos := i;
+            if i <= Len then CurCh := Source[i] else CurCh := #0;
+          end
+          else
+          begin
+            Advance;
+            while CurCh in ['a'..'z', 'A'..'Z', '_', '0'..'9'] do Advance;
+          end;
           idLen := Pos - idStart;
           t.Kind := tkName;
           if (idLen >= 2) and (idLen <= 8) and (Source[idStart] in ['a'..'w']) then

@@ -8,13 +8,14 @@ unit lualibbase;
 interface
 
 uses
-  SysUtils, Classes, Math, luacore, luavm, luaaux, luaparse;
+  SysUtils, Classes, Math, luacore, luavm, luaaux, luaparse, lualex;
 
 procedure OpenBase(L: TLua);
 
 // loads a chunk from memory: returns False and an error message on failure
 function LoadBuffer(L: TLua; const buf: RawByteString; const name, mode: string;
-                    var f: TFunction; var err: string): Boolean;
+                    var f: TFunction; var err: string;
+                    AReader: TLexReader = nil; AReaderData: Pointer = nil): Boolean;
 function ReadFileContent(const fname: string; var content: RawByteString): Boolean;
 procedure PrepareFileChunk(var s: RawByteString);
 procedure SetEnvUpvalue(L: TLua; f: TFunction; constref env: TLuaValue);
@@ -100,7 +101,8 @@ begin
 end;
 
 function LoadBuffer(L: TLua; const buf: RawByteString; const name, mode: string;
-                    var f: TFunction; var err: string): Boolean;
+                    var f: TFunction; var err: string;
+                    AReader: TLexReader; AReaderData: Pointer): Boolean;
 begin
   Result := False;
   try
@@ -120,7 +122,7 @@ begin
         err := Format('attempt to load a text chunk (mode is ''%s'')', [mode]);
         Exit;
       end;
-      f := LuaCompile(L, buf, name);
+      f := LuaCompile(L, buf, name, AReader, AReaderData);
     end;
     Result := True;
   except
@@ -525,14 +527,56 @@ begin
     Result := L.Top - (funcIdx - 1);
 end;
 
+type
+  TLoadReader = record
+    L: TLua;
+    Fn: TLuaValue;
+  end;
+  PLoadReader = ^TLoadReader;
+
+// One piece of a chunk given to load as a function; False at the end (nil or an empty string).
+// An error of the function (or a bad result) is raised, so that it ends the parse.
+function LoadReaderPiece(Data: Pointer; out piece: RawByteString): Boolean;
+var
+  r: Integer;
+  v: TLuaValue;
+  msg: string;
+begin
+  piece := '';
+  with PLoadReader(Data)^ do
+  begin
+    LuaPush(L, Fn);
+    Inc(L.NNY);   // the function cannot yield: the parser is waiting for it
+    try
+      r := LuaProtectedCall(L, 0, 1, 0);
+    finally
+      Dec(L.NNY);
+    end;
+    if r <> 0 then
+    begin
+      msg := string(ToStringAux(L, L.Stack[L.Top - 1]));
+      Dec(L.Top);
+      raise ELuaError.CreateMsg(msg);
+    end;
+    v := L.Stack[L.Top - 1];
+    Dec(L.Top);
+    if v.Vt = vtNil then Exit(False);
+    if v.Vt in [vtInt, vtFlt] then piece := ToStringAux(L, v)
+    else if v.Vt = vtStr then piece := v.S.Str
+    else LuaError(L, 'reader function must return a string');
+    Result := Length(piece) > 0;
+  end;
+end;
+
 function luaB_load(L: TLua): Integer;
 var
   v: TLuaValue;
   src: RawByteString;
   name, mode, err: string;
   f: TFunction;
-  piece: TLuaValue;
-  r: Integer;
+  rd: TLoadReader;
+  piece: RawByteString;
+  more, saveInGC: Boolean;
 begin
   v := LuaArg(L, 1);
   mode := string(OptString(L, 3, 'bt'));
@@ -546,30 +590,48 @@ begin
   begin
     if v.Vt <> vtFunc then TypeErrorArg(L, 1, 'function');
     name := string(OptString(L, 2, '=(load)'));
-    // read the chunk piece by piece
+    rd.L := L;
+    rd.Fn := v;
+    // The first piece tells binary from text. A text chunk is then parsed while the rest is
+    // read, so the function is called only as far as the parser needs (like the reference).
     src := '';
-    while True do
+    try
+      more := LoadReaderPiece(@rd, src);
+      if more and (src[1] = #27) then
+      begin
+        // binary chunks are read completely
+        while LoadReaderPiece(@rd, piece) do src := src + piece;
+        more := False;
+      end;
+    except
+      on E: ELuaError do
+      begin
+        PushNil(L);
+        PushStr(L, RawByteString(E.Message));
+        Exit(2);
+      end;
+    end;
+    if more then
     begin
-      LuaPush(L, v);
-      r := LuaProtectedCall(L, 0, 1, 0);
-      if r <> 0 then
-      begin
-        err := string(ToStringAux(L, L.Stack[L.Top - 1]));
-        PushNil(L);
-        PushStr(L, RawByteString(err));
-        Exit(2);
+      // Lua code runs while the parser holds objects that no root reaches yet: no collection meanwhile
+      saveInGC := L.Main.InGC;
+      L.Main.InGC := True;
+      try
+        if not LoadBuffer(L, src, name, mode, f, err, @LoadReaderPiece, @rd) then
+        begin
+          PushNil(L);
+          PushStr(L, RawByteString(err));
+          Exit(2);
+        end;
+      finally
+        L.Main.InGC := saveInGC;
       end;
-      piece := L.Stack[L.Top - 1];
-      Dec(L.Top);
-      if piece.Vt = vtNil then Break;
-      if piece.Vt <> vtStr then
-      begin
-        PushNil(L);
-        PushStr(L, 'reader function must return a string');
-        Exit(2);
-      end;
-      if piece.S.Len = 0 then Break;
-      src := src + piece.S.Str;
+      if LuaGetTop(L) >= 4 then
+        SetEnvUpvalue(L, f, LuaArg(L, 4))
+      else
+        SetEnvUpvalue(L, f, LuaTab(L.GlobalT));
+      LuaPush(L, LuaFunc(f));
+      Exit(1);
     end;
   end;
   if not LoadBuffer(L, src, name, mode, f, err) then

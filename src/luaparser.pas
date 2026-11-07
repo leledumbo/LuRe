@@ -14,7 +14,7 @@ uses
 // Parses a chunk. 'owner' receives every node created (the caller frees it
 // after code generation).
 function ParseChunk(L: TLua; const source: RawByteString; const chunkName: string;
-                    out owner: TAstOwner): TFuncDecl;
+                    out owner: TAstOwner; AReader: TLexReader = nil; AReaderData: Pointer = nil): TFuncDecl;
 
 implementation
 
@@ -93,7 +93,7 @@ type
     EnvName: TStringObj;
     Level: Integer;
     constructor Create(AL: TLua; const source: RawByteString; const chunkName: string;
-                       AOwner: TAstOwner);
+                       AOwner: TAstOwner; AReader: TLexReader = nil; AReaderData: Pointer = nil);
     destructor Destroy; override;
     function Parse: TFuncDecl;
   private
@@ -189,12 +189,12 @@ type
 { ===================================================================== }
 
 constructor TParser.Create(AL: TLua; const source: RawByteString; const chunkName: string;
-  AOwner: TAstOwner);
+  AOwner: TAstOwner; AReader: TLexReader; AReaderData: Pointer);
 begin
   L := AL;
   Owner := AOwner;
   ForStateName := AL.NewString('(for state)');
-  Lex := TLexer.Create(AL, source, ChunkIdStr(chunkName));
+  Lex := TLexer.Create(AL, source, ChunkIdStr(chunkName), AReader, AReaderData);
   EnvName := AL.NewString('_ENV');
 end;
 
@@ -1857,13 +1857,13 @@ begin
 end;
 
 function ParseChunk(L: TLua; const source: RawByteString; const chunkName: string;
-                    out owner: TAstOwner): TFuncDecl;
+                    out owner: TAstOwner; AReader: TLexReader; AReaderData: Pointer): TFuncDecl;
 var
   p: TParser;
 begin
   owner := TAstOwner.Create;
   try
-    p := TParser.Create(L, source, chunkName, owner);
+    p := TParser.Create(L, source, chunkName, owner, AReader, AReaderData);
     try
       Result := p.Parse;
     finally

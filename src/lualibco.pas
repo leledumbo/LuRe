@@ -320,7 +320,7 @@ begin
   if (L.Runner = nil) or (L = L.Main) then
     LuaError(L, 'attempt to yield from outside a coroutine');
   if L.NNY > 0 then
-    LuaError(L, 'attempt to yield across a C-call boundary');
+    raise ELuaError.CreateMsg('attempt to yield across a C-call boundary');   // no position: raised from a C function
   r := RunnerOf(L);
   r.YieldBase := L.Top - n;
   r.YieldN := n;
