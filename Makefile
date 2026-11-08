@@ -8,9 +8,9 @@
 
 FPC      ?= fpc
 # compiler optimization flags; override for a tuned build, e.g.
-#   make x86_64-linux FPCFLAGS='-O4 -CpZEN3 -OpZEN3 -CX -XX -Xs'
+#   make x86_64-linux FPCFLAGS='-O4 -CX -XX -Xs'
 # (the binary is rebuilt when the flags change)
-FPCFLAGS ?= -O2
+FPCFLAGS ?= -O4 -CX -XXs
 
 # <cpu>-<os> names understood by 'fpc -P<cpu> -T<os>'
 TARGETS := x86_64-linux i386-linux aarch64-linux arm-linux \
@@ -19,6 +19,13 @@ TARGETS := x86_64-linux i386-linux aarch64-linux arm-linux \
 
 # the platform of the installed compiler
 NATIVE := $(shell $(FPC) -iTP 2>/dev/null)-$(shell $(FPC) -iTO 2>/dev/null)
+
+# a native x86_64 build targets x86-64-v3 when the build machine supports it
+# (the gain is small, the binary then needs a v3 CPU); CPUFLAGS= disables it
+V3FLAGS := $(shell for f in avx avx2 bmi1 bmi2 fma f16c movbe abm; do \
+  grep -qw $$f /proc/cpuinfo 2>/dev/null || exit 0; done; \
+  [ "$$($(FPC) -iTP 2>/dev/null)" = x86_64 ] && echo -CpX86-64-V3 -CfX86-64-V3)
+CPUFLAGS ?= $(V3FLAGS)
 
 SRC := $(wildcard src/*.pas)
 
@@ -51,12 +58,12 @@ $(1): bin/$(1)/lua
 # records the flags so that a change of FPCFLAGS triggers a rebuild
 units/$(1)/.flags: FORCE
 	@mkdir -p units/$(1)
-	@echo '$$(FPCFLAGS)' | cmp -s - $$@ || echo '$$(FPCFLAGS)' > $$@
+	@echo '$$(FPCFLAGS) $$(if $$(filter $(1),$$(NATIVE)),$$(CPUFLAGS))' | cmp -s - $$@ || echo '$$(FPCFLAGS) $$(if $$(filter $(1),$$(NATIVE)),$$(CPUFLAGS))' > $$@
 
 bin/$(1)/lua: $(SRC) units/$(1)/.flags
 	@mkdir -p bin/$(1) units/$(1)
 	@rm -f units/$(1)/*.ppu units/$(1)/*.o
-	$(FPC) $(FPCFLAGS) -P$$(firstword $$(subst -, ,$(1))) -T$$(patsubst $$(firstword $$(subst -, ,$(1)))-%,%,$(1)) \
+	$(FPC) $(FPCFLAGS) $$(if $$(filter $(1),$$(NATIVE)),$$(CPUFLAGS)) -P$$(firstword $$(subst -, ,$(1))) -T$$(patsubst $$(firstword $$(subst -, ,$(1)))-%,%,$(1)) \
 	  -FUunits/$(1) -FEbin/$(1) -Fusrc -olua src/lua.pas
 
 clean-$(1):
